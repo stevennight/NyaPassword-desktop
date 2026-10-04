@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# The workspace mirrors the local layout: desktop/ and common/ (latest main;
+# a release pins it with COMMON_REF instead) side by side, target/ next to them.
+jobs:
+  build:
+    name: Test and build (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, macos-latest, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    steps:
+      - name: Check out desktop
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: desktop
+          persist-credentials: false
+
+      - name: Check out common
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ github.repository_owner }}/NyaPassword-common
+          # read-only deploy key of the (private) common repository
+          ssh-key: ${{ secrets.COMMON_DEPLOY_KEY }}
+          path: common
+          persist-credentials: false
+
+      - name: Install Linux Tauri dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential file libayatana-appindicator3-dev libgtk-3-dev librsvg2-dev libssl-dev libwebkit2gtk-4.1-dev libxdo-dev patchelf pkg-config
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: |
+            desktop/package-lock.json
+            common/web/package-lock.json
+
+      - name: Set up Rust
+        shell: bash
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt --no-self-update && rustup default stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: desktop -> ../target
+
+      - name: Check versions
+        shell: pwsh
+        run: |
+          . ./common/scripts/release-lib.ps1
+          Test-NpwVersion -Repo desktop -Tomls @('src-tauri/Cargo.toml') -Jsons @('package.json', 'src-tauri/tauri.conf.json') | Out-Null
+
+      - name: Install npm packages
+        shell: bash
+        run: |
+          npm ci --prefix common/web --no-audit --no-fund
+          npm ci --prefix desktop --no-audit --no-fund
+
+      # the Rust build embeds the UI (vite --mode desktop, no WebAssembly needed)
+      - name: Build the UI
+        working-directory: desktop
+        run: npm run web
+
+      - name: Format
+        if: runner.os == 'Linux'
+        working-directory: desktop
+        run: cargo fmt --check
+
+      - name: Clippy
+        if: runner.os == 'Linux'
+        working-directory: desktop
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        working-directory: desktop
+        # Not --locked: common main may be ahead of this Cargo.lock (releases build with --locked).
+        run: cargo test --workspace
+
+      - name: Build the app (no installers)
+        working-directory: desktop
+        run: npx tauri build --ci --no-bundle

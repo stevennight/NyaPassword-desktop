@@ -1,0 +1,16 @@
+# The desktop app (src-tauri) and the release-signing helper. The common
+# crates come in as path dependencies from ../common (checked out side by side).
+[workspace]
+resolver = "2"
+members = ["src-tauri", "tools/update-sign"]
+
+# Same settings as common's workspace, so the shared ../target can reuse builds.
+[profile.release]
+lto = "thin"
+debug = "line-tables-only"
+
+# Argon2 and the AEAD are unusably slow unoptimized; keep debug builds usable.
+[profile.dev.package."*"]
+opt-level = 2
+[profile.test.package."*"]
+opt-level = 2

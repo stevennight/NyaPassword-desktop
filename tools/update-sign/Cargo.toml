@@ -1,0 +1,10 @@
+[package]
+name = "npw-update-sign"
+description = "Generates the update signing key pair and signs release checksums (minisign format)"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+minisign = "0.10"

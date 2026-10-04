@@ -1,0 +1,283 @@
+name: Release
+
+# Push a tag v<VERSION> (scripts/release.ps1 makes it) to build the installers
+# (Windows NSIS + portable zip, macOS dmg for arm64 and x64, Linux AppImage and
+# deb), write SHA256SUMS, sign it for the in-app updater (SHA256SUMS.minisig,
+# secret NPW_UPDATE_PRIVATE_KEY) and publish a GitHub release. Versions with a
+# suffix (0.2.0-beta.1) are published as pre-releases. Running it by hand
+# (workflow_dispatch) builds everything as a dry run without publishing.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify and test (pinned common)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+      common: ${{ steps.meta.outputs.common }}
+    steps:
+      - name: Check out desktop
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: desktop
+          persist-credentials: false
+
+      - name: Check tag matches VERSION
+        id: meta
+        run: |
+          version="$(tr -d '\r\n' < desktop/VERSION)"
+          if [ "${GITHUB_REF_TYPE}" = tag ] && [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match VERSION ${version}" >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          case "$version" in *-*) echo "prerelease=true" >> "$GITHUB_OUTPUT" ;; *) echo "prerelease=false" >> "$GITHUB_OUTPUT" ;; esac
+          ref="$(tr -d '\r\n' < desktop/COMMON_REF 2>/dev/null || echo main)"
+          echo "common: ${ref:-main}"
+          echo "common=${ref:-main}" >> "$GITHUB_OUTPUT"
+
+      - name: Check out common
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ github.repository_owner }}/NyaPassword-common
+          # read-only deploy key of the (private) common repository
+          ssh-key: ${{ secrets.COMMON_DEPLOY_KEY }}
+          ref: ${{ steps.meta.outputs.common }}
+          path: common
+          persist-credentials: false
+
+      - name: Check versions
+        shell: pwsh
+        run: |
+          . ./common/scripts/release-lib.ps1
+          Test-NpwVersion -Repo desktop -Tomls @('src-tauri/Cargo.toml') -Jsons @('package.json', 'src-tauri/tauri.conf.json') | Out-Null
+
+      - name: Install Linux Tauri dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential file libayatana-appindicator3-dev libgtk-3-dev librsvg2-dev libssl-dev libwebkit2gtk-4.1-dev libxdo-dev patchelf pkg-config
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: |
+            desktop/package-lock.json
+            common/web/package-lock.json
+
+      - name: Set up Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+
+      - name: Test
+        run: |
+          npm ci --prefix common/web --no-audit --no-fund
+          npm ci --prefix desktop --no-audit --no-fund
+          (cd desktop && npm run web && cargo test --workspace --locked)
+
+  build:
+    name: Build ${{ matrix.label }}
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: windows_x64
+            os: windows-2022
+            target: x86_64-pc-windows-msvc
+            bundles: nsis
+          - label: macos_arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            bundles: dmg
+          - label: macos_x64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            bundles: dmg
+          - label: linux_x64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            bundles: appimage,deb
+    steps:
+      - name: Check out desktop
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: desktop
+          persist-credentials: false
+
+      - name: Check out common
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ github.repository_owner }}/NyaPassword-common
+          # read-only deploy key of the (private) common repository
+          ssh-key: ${{ secrets.COMMON_DEPLOY_KEY }}
+          ref: ${{ needs.verify.outputs.common }}
+          path: common
+          persist-credentials: false
+
+      - name: Install Linux Tauri dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential file libayatana-appindicator3-dev libgtk-3-dev librsvg2-dev libssl-dev libwebkit2gtk-4.1-dev libxdo-dev patchelf pkg-config
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: |
+            desktop/package-lock.json
+            common/web/package-lock.json
+
+      - name: Set up Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+          rustup target add ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: desktop -> ../target
+          key: ${{ matrix.target }}
+
+      - name: Install npm packages
+        shell: bash
+        run: |
+          npm ci --prefix common/web --no-audit --no-fund
+          npm ci --prefix desktop --no-audit --no-fund
+
+      - name: Build installers
+        working-directory: desktop
+        shell: bash
+        env:
+          # compiled into the app's updater (src-tauri/src/updater.rs)
+          NPW_UPDATE_REPO: ${{ github.repository }}
+          NPW_UPDATE_PUBKEY: ${{ secrets.NPW_UPDATE_PUBKEY }}
+        run: |
+          if [ -z "${NPW_UPDATE_PUBKEY}" ]; then
+            echo "::warning::NPW_UPDATE_PUBKEY is not set: this build will not install updates by itself"
+          fi
+          npx tauri build --ci --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} -- --locked
+
+      - name: Collect installers
+        shell: bash
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          LABEL: ${{ matrix.label }}
+        run: |
+          release="target/${TARGET}/release"
+          bundle="${release}/bundle"
+          mkdir -p dist
+          one() { # <find pattern> <destination name>
+            local found
+            found="$(find "$bundle" -type f -name "$1")"
+            test "$(printf '%s\n' "$found" | grep -c .)" -eq 1 || { echo "expected one $1 in $bundle, found: $found" >&2; exit 1; }
+            cp "$found" "dist/$2"
+          }
+          case "$LABEL" in
+            windows_x64)
+              one '*-setup.exe' "NyaPassword_${VERSION}_x64-setup.exe"
+              portable="NyaPassword_${VERSION}_windows_x64"
+              mkdir -p "stage/${portable}"
+              cp "${release}/nyapassword-desktop.exe" "stage/${portable}/NyaPassword.exe"
+              cp desktop/LICENSE desktop/README.md "stage/${portable}/"
+              pwsh -NoProfile -Command "Compress-Archive -Path 'stage/${portable}' -DestinationPath 'dist/${portable}.zip'"
+              ;;
+            macos_*)
+              one '*.dmg' "NyaPassword_${VERSION}_${LABEL}.dmg"
+              ;;
+            linux_x64)
+              one '*.AppImage' "NyaPassword_${VERSION}_linux_x64.AppImage"
+              one '*.deb' "NyaPassword_${VERSION}_linux_x64.deb"
+              ;;
+          esac
+          ls -l dist
+
+      - name: Upload installers
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: desktop-${{ matrix.label }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: [verify, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Check out desktop
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: desktop
+          persist-credentials: false
+
+      # the signing tool is a member of the desktop workspace, which needs common to resolve
+      - name: Check out common
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ github.repository_owner }}/NyaPassword-common
+          ssh-key: ${{ secrets.COMMON_DEPLOY_KEY }}
+          ref: ${{ needs.verify.outputs.common }}
+          path: common
+          persist-credentials: false
+
+      - name: Download installers
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          pattern: desktop-*
+          merge-multiple: true
+
+      - name: Write checksums
+        run: |
+          cd dist
+          rm -f SHA256SUMS SHA256SUMS.minisig
+          sha256sum * > SHA256SUMS
+          ls -l
+          cat SHA256SUMS
+
+      - name: Sign checksums for the in-app updater
+        env:
+          NPW_UPDATE_PRIVATE_KEY: ${{ secrets.NPW_UPDATE_PRIVATE_KEY }}
+          NPW_UPDATE_PUBKEY: ${{ secrets.NPW_UPDATE_PUBKEY }}
+        run: |
+          if [ -z "${NPW_UPDATE_PRIVATE_KEY}" ]; then
+            echo "::warning::NPW_UPDATE_PRIVATE_KEY is not set: no SHA256SUMS.minisig, installed apps will refuse this update"
+            exit 0
+          fi
+          rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+          (cd desktop && cargo build --quiet --release --locked -p npw-update-sign)
+          sign=target/release/npw-update-sign
+          "$sign" sign dist/SHA256SUMS
+          if [ -n "${NPW_UPDATE_PUBKEY}" ]; then
+            "$sign" verify dist/SHA256SUMS "${NPW_UPDATE_PUBKEY}"
+          fi
+
+      - name: Publish
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          name: NyaPassword Desktop ${{ github.ref_name }}
+          prerelease: ${{ needs.verify.outputs.prerelease == 'true' }}
+          generate_release_notes: true
+          files: dist/*

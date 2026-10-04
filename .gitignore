@@ -1,0 +1,11 @@
+/node_modules/
+/target/
+/src-tauri/target/
+/src-tauri/gen/schemas/
+/release/
+*.log
+.DS_Store
+.idea/
+.vscode/
+# signing keys never live in a repository (they go to ../signing)
+*.key

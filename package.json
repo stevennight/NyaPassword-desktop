@@ -1,0 +1,17 @@
+{
+  "name": "nyapassword-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "description": "NyaPassword desktop app (Tauri 2) around the shared web UI in ../common/web",
+  "type": "module",
+  "scripts": {
+    "web": "npm --prefix ../common/web run build:desktop",
+    "web:dev": "npm --prefix ../common/web run dev:desktop",
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.12.1"
+  }
+}

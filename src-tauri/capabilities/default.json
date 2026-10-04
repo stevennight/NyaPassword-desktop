@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The vault window: core events and the app's own commands only (no plugin APIs are exposed to the page).",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}
