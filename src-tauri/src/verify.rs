@@ -3,12 +3,16 @@
 //! vault window, Quick Access and the SSH signature prompt.
 //!
 //! - The master password: checked by the core (`Client::verify_password`).
+//! - The PIN (when set): the core opens the PIN blob and checks the key
+//!   (`Client::verify_pin`); wrong tries count towards the five that delete
+//!   the PIN (`local_unlock.rs`).
 //! - Windows Hello: when quick unlock is on, the same signature path as quick
 //!   unlock (the Hello key signs the stored challenge, the derived key must
 //!   open the stored account key, and the core checks that it is this
 //!   account's key); otherwise a plain Hello presence check
-//!   (`UserConsentVerifier`). The password always works.
+//!   (`UserConsentVerifier`).
 //!
+//! Biometrics and the PIN follow the 14-day rule; the password always works.
 //! This is a guard against someone using the unlocked app, not encryption.
 
 use std::path::PathBuf;
@@ -20,9 +24,10 @@ use serde::Serialize;
 use zeroize::Zeroizing;
 
 use crate::error::{BridgeError, CmdResult};
-use crate::platform::Platform;
+use crate::local_unlock::Guards;
+use crate::platform::{Platform, QuickError};
 use crate::quick_unlock;
-use crate::state::AppState;
+use crate::state::{now_ms, AppState};
 
 /// How Windows Hello (or another OS method) can verify the user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +59,9 @@ pub struct VerifyOptions {
     pub biometric: bool,
     /// "Windows Hello".
     pub label: String,
+    /// A PIN is set and usable now.
+    pub pin: bool,
+    pub pin_tries_left: u32,
 }
 
 /// What a verification needs; built on the command's thread, used on a worker
@@ -62,6 +70,7 @@ pub struct Verifier {
     platform: &'static dyn Platform,
     dir: PathBuf,
     client: Arc<Client>,
+    guards: Arc<Guards>,
 }
 
 impl Verifier {
@@ -70,16 +79,25 @@ impl Verifier {
             platform: st.platform,
             dir: st.dir.clone(),
             client: st.client()?,
+            guards: st.guards.clone(),
         })
     }
 
+    fn account(&self) -> String {
+        self.client.lock_state().account_id
+    }
+
     fn stored(&self) -> Option<quick_unlock::Stored> {
-        let account = self.client.lock_state().account_id;
+        let account = self.account();
         quick_unlock::load(&self.dir).filter(|s| !account.is_empty() && s.account_id == account)
     }
 
     /// Blocking.
     pub fn method(&self) -> Option<Biometric> {
+        // biometrics follow the 14-day rule like quick unlock (the password always works)
+        if crate::local_unlock::fresh(&self.guards.get(&self.account()), now_ms()).is_err() {
+            return None;
+        }
         let supported = self.platform.quick_unlock_supported();
         let stored = supported && self.stored().is_some();
         // the presence check is only asked about when the key path is not there
@@ -89,20 +107,31 @@ impl Verifier {
 
     /// Blocking.
     pub fn options(&self) -> VerifyOptions {
+        let unlocked = self.client.is_unlocked();
+        let pin = self.guards.pin_status(&self.account(), now_ms());
         VerifyOptions {
-            biometric: self.client.is_unlocked() && self.method().is_some(),
+            biometric: unlocked && self.method().is_some(),
             label: self.platform.quick_unlock_label().into(),
+            pin: unlocked && pin.usable,
+            pin_tries_left: pin.tries_left,
         }
     }
 
-    /// Verifies with the master password, or with Windows Hello when there is
-    /// none. Blocking (the Hello dialog). Only while unlocked.
-    pub fn verify(&self, password: Option<&str>) -> CmdResult<()> {
+    /// Verifies with the master password, else the PIN, else Windows Hello.
+    /// Blocking (Argon2, the Hello dialog). Only while unlocked.
+    pub fn verify(&self, password: Option<&str>, pin: Option<&str>) -> CmdResult<()> {
         if !self.client.is_unlocked() {
             return Err(npw_core::CoreError::Locked.into());
         }
         if let Some(pw) = password.filter(|p| !p.is_empty()) {
             self.client.verify_password(pw)?;
+            return Ok(());
+        }
+        if let Some(pin) = pin.filter(|p| !p.is_empty()) {
+            let client = &self.client;
+            self.guards.try_pin(&self.account(), now_ms(), |blob| {
+                client.verify_pin(blob, pin)
+            })?;
             return Ok(());
         }
         let label = self.platform.quick_unlock_label();
@@ -113,11 +142,15 @@ impl Verifier {
                     .ok_or_else(|| BridgeError::invalid(format!("没有开启 {label} 解锁")))?;
                 let challenge = quick_unlock::challenge(&stored).map_err(BridgeError::invalid)?;
                 let name = quick_unlock::credential_name(&stored.account_id);
-                let signature = Zeroizing::new(
-                    self.platform
-                        .quick_unlock_sign(&name, &challenge)
-                        .map_err(BridgeError::invalid)?,
-                );
+                let signature =
+                    Zeroizing::new(self.platform.quick_unlock_sign(&name, &challenge).map_err(
+                        |e| {
+                            if let QuickError::Invalidated(_) = e {
+                                quick_unlock::remove(&self.dir);
+                            }
+                            BridgeError::invalid(e)
+                        },
+                    )?);
                 let ak = quick_unlock::unwrap(&stored, &signature).map_err(BridgeError::invalid)?;
                 self.client.verify_key(&ak)?;
                 Ok(())

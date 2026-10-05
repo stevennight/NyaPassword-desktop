@@ -19,6 +19,8 @@ use zeroize::Zeroizing;
 
 use crate::error::{BridgeError, CmdResult};
 use crate::export;
+use crate::local_unlock::{self, Stale};
+use crate::platform::QuickError;
 use crate::quick_unlock;
 use crate::settings::{ExportSettings, Pairing};
 use crate::state::{now_ms, AppState, EVENT_EXPORT};
@@ -210,12 +212,21 @@ pub async fn verify_user_options(state: St<'_>) -> CmdResult<VerifyOptions> {
 }
 
 /// Verifies the user without changing the lock state: the master password,
-/// or Windows Hello when `password` is empty.
+/// else the PIN, else Windows Hello (both empty).
 #[tauri::command]
-pub async fn verify_user(state: St<'_>, password: Option<String>) -> CmdResult<()> {
+pub async fn verify_user(
+    state: St<'_>,
+    password: Option<String>,
+    pin: Option<String>,
+) -> CmdResult<()> {
     let password = password.map(Zeroizing::new);
+    let pin = pin.map(Zeroizing::new);
     let v = Verifier::new(&state)?;
-    blocking(move || v.verify(password.as_deref().map(|p| p.as_str()))).await?
+    blocking(move || v.verify(secret(&password), secret(&pin))).await?
+}
+
+fn secret(s: &Option<Zeroizing<String>>) -> Option<&str> {
+    s.as_deref().map(|p| p.as_str())
 }
 
 #[tauri::command]
@@ -226,7 +237,7 @@ pub async fn sign_out(state: St<'_>, force: bool) -> CmdResult<()> {
     state.lock();
     disable_quick_unlock(&state, &account).await;
     state.password_this_run.store(false, Ordering::SeqCst);
-    state.update_settings(|s| s.last_password_unlock_at = 0);
+    state.guards.forget();
     Ok(())
 }
 
@@ -237,11 +248,35 @@ pub fn emergency_kit(state: St<'_>) -> CmdResult<EmergencyKit> {
 
 // ---------------------------------------------------------------- quick unlock
 
+/// What the lock screen and the settings can offer (bridge.ts `QuickUnlockStatus`).
 #[derive(Debug, Clone, Serialize)]
 pub struct QuickStatus {
+    /// The OS offers Windows Hello.
     available: bool,
+    /// Windows Hello can unlock right now.
     enabled: bool,
     label: String,
+    /// Windows Hello unlock is set up (it may be suspended right now).
+    quick_set: bool,
+    /// "启动时可直接用生物识别解锁".
+    biometric_at_start: bool,
+    /// The PIN can be set up here (the OS credential store works).
+    pin_supported: bool,
+    pin_set: bool,
+    /// The PIN can unlock right now.
+    pin: bool,
+    pin_tries_left: u32,
+    /// Why biometrics and the PIN need the master password now (empty: they do not).
+    password_reason: String,
+}
+
+fn quick_allowed(state: &AppState, account: &str) -> Result<(), Stale> {
+    state.guards.quick_allowed(
+        account,
+        now_ms(),
+        state.password_this_run.load(Ordering::SeqCst),
+        state.settings().unlock.biometric_at_start,
+    )
 }
 
 #[tauri::command]
@@ -250,18 +285,32 @@ pub async fn quick_unlock_status(state: St<'_>) -> CmdResult<QuickStatus> {
     let lock = c.lock_state();
     let platform = state.platform;
     let supported = lock.signed_in && blocking(move || platform.quick_unlock_supported()).await?;
-    let stored = quick_unlock::load(&state.dir).filter(|s| s.account_id == lock.account_id);
-    let enabled = supported
-        && stored.is_some()
-        && quick_unlock::allowed(
-            state.password_this_run.load(Ordering::SeqCst),
-            state.settings().last_password_unlock_at,
-            now_ms(),
-        );
+    let quick_set = quick_unlock::load(&state.dir)
+        .filter(|s| s.account_id == lock.account_id)
+        .is_some();
+    let allowed = quick_allowed(&state, &lock.account_id);
+    let pin = state.guards.pin_status(&lock.account_id, now_ms());
+    let reason = match allowed {
+        Ok(()) => String::new(),
+        // a restart only stops biometrics; the PIN still works
+        Err(Stale::Restarted) if pin.usable => String::new(),
+        Err(s) => s.message().into(),
+    };
     Ok(QuickStatus {
         available: supported,
-        enabled,
+        enabled: supported && quick_set && allowed.is_ok(),
         label: platform.quick_unlock_label().into(),
+        quick_set: supported && quick_set,
+        biometric_at_start: state.settings().unlock.biometric_at_start,
+        pin_supported: lock.signed_in && pin.supported,
+        pin_set: pin.set,
+        pin: lock.signed_in && pin.usable,
+        pin_tries_left: pin.tries_left,
+        password_reason: if quick_set || pin.set {
+            reason
+        } else {
+            String::new()
+        },
     })
 }
 
@@ -283,8 +332,9 @@ pub async fn set_quick_unlock(state: St<'_>, enabled: bool) -> CmdResult<()> {
         disable_quick_unlock(&state, &account).await;
         return Ok(());
     }
-    if !state.password_this_run.load(Ordering::SeqCst) {
-        return Err(BridgeError::invalid("请先用主密码解锁，再开启快速解锁"));
+    // within 14 days of a master-password unlock on this device
+    if let Err(s) = local_unlock::fresh(&state.guards.get(&account), now_ms()) {
+        return Err(BridgeError::new("password_required", s.message()));
     }
     let ak = Zeroizing::new(c.quick_unlock_key()?);
     let challenge = npw_crypto::random_bytes::<32>();
@@ -306,14 +356,8 @@ pub async fn quick_unlock(state: St<'_>) -> CmdResult<()> {
     let c = state.client()?;
     let account = c.lock_state().account_id;
     let label = state.platform.quick_unlock_label();
-    if !quick_unlock::allowed(
-        state.password_this_run.load(Ordering::SeqCst),
-        state.settings().last_password_unlock_at,
-        now_ms(),
-    ) {
-        return Err(BridgeError::invalid(format!(
-            "需要输入主密码（重启后或距上次输入主密码超过 14 天时不能使用 {label}）"
-        )));
+    if let Err(s) = quick_allowed(&state, &account) {
+        return Err(BridgeError::new("password_required", s.message()));
     }
     let stored = quick_unlock::load(&state.dir)
         .filter(|s| s.account_id == account)
@@ -321,11 +365,17 @@ pub async fn quick_unlock(state: St<'_>) -> CmdResult<()> {
     let challenge = quick_unlock::challenge(&stored).map_err(BridgeError::invalid)?;
     let platform = state.platform;
     let name = quick_unlock::credential_name(&account);
-    let signature = Zeroizing::new(
-        blocking(move || platform.quick_unlock_sign(&name, &challenge))
-            .await?
-            .map_err(BridgeError::invalid)?,
-    );
+    let signed = blocking(move || platform.quick_unlock_sign(&name, &challenge)).await?;
+    let signature = match signed {
+        Ok(s) => Zeroizing::new(s),
+        Err(e) => {
+            // the Hello key is gone (Windows Hello reset): off, the password is needed
+            if let QuickError::Invalidated(_) = e {
+                disable_quick_unlock(&state, &account).await;
+            }
+            return Err(BridgeError::invalid(e));
+        }
+    };
     let ak = match quick_unlock::unwrap(&stored, &signature) {
         Ok(k) => k,
         Err(e) => {
@@ -341,6 +391,57 @@ pub async fn quick_unlock(state: St<'_>) -> CmdResult<()> {
     }
     state.notify_unlocked();
     Ok(())
+}
+
+// ---------------------------------------------------------------- PIN (desktop and Android only)
+
+/// Unlocks with the PIN (14-day rule; five wrong tries delete it).
+#[tauri::command]
+pub async fn pin_unlock(state: St<'_>, pin: String) -> CmdResult<()> {
+    let pin = Zeroizing::new(pin);
+    let c = state.client()?;
+    let account = c.lock_state().account_id;
+    let guards = state.guards.clone();
+    blocking(move || guards.try_pin(&account, now_ms(), |blob| c.unlock_with_pin(blob, &pin)))
+        .await??;
+    state.notify_unlocked();
+    Ok(())
+}
+
+/// Sets (or changes) the PIN: wraps the account key under it and stores the
+/// blob in the OS credential store. Only while unlocked, within 14 days of a
+/// master-password unlock.
+#[tauri::command]
+pub async fn set_pin(state: St<'_>, pin: String) -> CmdResult<()> {
+    let pin = Zeroizing::new(pin);
+    if pin.chars().count() < npw_core::pin::MIN_PIN_CHARS {
+        return Err(BridgeError::invalid("PIN 至少 4 个字符"));
+    }
+    let c = state.client()?;
+    let account = c.lock_state().account_id;
+    if !state.guards.persistent() {
+        return Err(BridgeError::invalid(
+            "设备密钥没有存在系统凭据存储中，这台设备不能设置 PIN",
+        ));
+    }
+    if let Err(s) = local_unlock::fresh(&state.guards.get(&account), now_ms()) {
+        return Err(BridgeError::new("password_required", s.message()));
+    }
+    let blob = blocking(move || c.pin_wrap(&pin)).await??;
+    state
+        .guards
+        .set_pin(&account, blob, now_ms())
+        .map_err(BridgeError::invalid)
+}
+
+#[tauri::command]
+pub fn remove_pin(state: St<'_>) -> CmdResult<()> {
+    state.guards.remove_pin().map_err(BridgeError::invalid)
+}
+
+#[tauri::command]
+pub fn set_biometric_at_start(state: St<'_>, enabled: bool) {
+    state.update_settings(|s| s.unlock.biometric_at_start = enabled);
 }
 
 // ---------------------------------------------------------------- sync, vaults, items
@@ -609,7 +710,16 @@ pub fn health_check(state: St<'_>) -> CmdResult<npw_core::HealthReport> {
 pub async fn change_password(state: St<'_>, current: String, next: String) -> CmdResult<()> {
     let current = Zeroizing::new(current);
     let next = Zeroizing::new(next);
-    Ok(state.client()?.change_password(&current, &next).await?)
+    let c = state.client()?;
+    c.change_password(&current, &next).await?;
+    // a new master password: biometrics and the PIN are set up again (design doc §4.5)
+    let account = c.lock_state().account_id;
+    disable_quick_unlock(&state, &account).await;
+    if let Err(e) = state.guards.remove_pin() {
+        log::warn!("could not delete the PIN after a password change: {e}");
+    }
+    state.mark_password_unlock();
+    Ok(())
 }
 
 #[tauri::command]
@@ -970,12 +1080,14 @@ pub async fn quick_verify(
     vault_id: String,
     item_id: String,
     password: Option<String>,
+    pin: Option<String>,
 ) -> CmdResult<()> {
     let password = password.map(Zeroizing::new);
+    let pin = pin.map(Zeroizing::new);
     // the item must exist
     item_content(&state, &vault_id, &item_id)?;
     let v = Verifier::new(&state)?;
-    blocking(move || v.verify(password.as_deref().map(|p| p.as_str()))).await??;
+    blocking(move || v.verify(secret(&password), secret(&pin))).await??;
     state.quick_grant.grant(&vault_id, &item_id);
     Ok(())
 }
@@ -1075,14 +1187,16 @@ pub async fn prompt_verify(
     window: tauri::WebviewWindow,
     state: St<'_>,
     password: Option<String>,
+    pin: Option<String>,
 ) -> CmdResult<()> {
     let password = password.map(Zeroizing::new);
+    let pin = pin.map(Zeroizing::new);
     let id = window.label().to_string();
     if state.prompts.info(&id).is_none() {
         return Err(BridgeError::invalid("这个请求已经结束"));
     }
     let v = Verifier::new(&state)?;
-    blocking(move || v.verify(password.as_deref().map(|p| p.as_str()))).await??;
+    blocking(move || v.verify(secret(&password), secret(&pin))).await??;
     state.prompts.mark_verified(&id);
     Ok(())
 }

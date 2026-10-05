@@ -10,6 +10,7 @@ mod device_key;
 mod error;
 mod export;
 mod ipc;
+mod local_unlock;
 mod platform;
 mod prompts;
 mod pure;
@@ -114,6 +115,10 @@ pub fn run() {
             commands::quick_unlock_status,
             commands::set_quick_unlock,
             commands::quick_unlock,
+            commands::pin_unlock,
+            commands::set_pin,
+            commands::remove_pin,
+            commands::set_biometric_at_start,
             commands::sync,
             commands::events_token,
             commands::vaults,

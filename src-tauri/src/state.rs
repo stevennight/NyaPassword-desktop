@@ -14,6 +14,7 @@ use crate::browser_bridge::BrowserBridge;
 use crate::clipboard::Clipboard;
 use crate::device_key::{self, KeyStorage};
 use crate::error::{BridgeError, CmdResult};
+use crate::local_unlock::{Guards, PlatformStore, SecretStore};
 use crate::platform::{self, Platform, TargetWindow};
 use crate::prompts::Prompts;
 use crate::settings::Settings;
@@ -29,6 +30,9 @@ pub const EVENT_EXPORT: &str = "npw:export";
 pub const EVENT_UPDATE: &str = "npw:update";
 /// A message for the main window (shown as a toast).
 pub const EVENT_NOTICE: &str = "npw:notice";
+/// A browser extension waits for this app to be unlocked (payload: the
+/// browser's name; empty when the request ended).
+pub const EVENT_UNLOCK_REQUEST: &str = "npw:unlock-request";
 
 pub struct AppState {
     pub dir: PathBuf,
@@ -38,8 +42,11 @@ pub struct AppState {
     /// Parsed imports waiting for the user's confirmation, by token (plaintext: dropped on lock).
     pub imports: Mutex<HashMap<String, (String, npw_import::ImportResult)>>,
     settings: Mutex<Settings>,
-    /// The master password was entered in this run of the app (quick unlock needs it).
+    /// The master password was entered in this run of the app (quick unlock
+    /// needs it unless "biometrics at start" is on).
     pub password_this_run: AtomicBool,
+    /// The 14-day rule and the PIN material (`local_unlock.rs`).
+    pub guards: Arc<Guards>,
     pub exporting: AtomicBool,
     pub clipboard: Clipboard,
     pub ssh: SshAgent,
@@ -64,6 +71,11 @@ impl AppState {
                 (Err(e), None)
             }
         };
+        // the guard sits next to the device key; without the OS store, in memory only
+        let store: Option<Box<dyn SecretStore>> = match key_storage {
+            Some(KeyStorage::Os) => Some(Box::new(PlatformStore(platform))),
+            _ => None,
+        };
         Self {
             dir,
             platform,
@@ -72,6 +84,7 @@ impl AppState {
             imports: Mutex::new(HashMap::new()),
             settings: Mutex::new(settings),
             password_this_run: AtomicBool::new(false),
+            guards: Arc::new(Guards::new(store)),
             exporting: AtomicBool::new(false),
             clipboard: Clipboard::default(),
             ssh: SshAgent::default(),
@@ -116,9 +129,21 @@ impl AppState {
         self.bridge.notify("locked");
     }
 
-    /// After any unlock: connected extensions may unlock now.
+    /// After any unlock: connected extensions may unlock now, and a waiting
+    /// unlock request of an extension is answered.
     pub fn notify_unlocked(&self) {
+        if let Ok(c) = &self.client {
+            self.guards.touch(&c.lock_state().account_id, now_ms());
+        }
         self.bridge.notify("unlocked");
+        self.bridge.wait.notify();
+    }
+
+    pub fn account_id(&self) -> String {
+        self.client
+            .as_ref()
+            .map(|c| c.lock_state().account_id)
+            .unwrap_or_default()
     }
 }
 
@@ -173,9 +198,11 @@ pub fn lock_all(app: &AppHandle, why: &str) {
 }
 
 impl AppState {
+    /// The master password was just entered: the 14 days start again.
     pub fn mark_password_unlock(&self) -> Settings {
         self.password_this_run.store(true, Ordering::SeqCst);
-        let now = now_ms();
-        self.update_settings(|s| s.last_password_unlock_at = now)
+        self.guards
+            .record_password_unlock(&self.account_id(), now_ms());
+        self.settings()
     }
 }

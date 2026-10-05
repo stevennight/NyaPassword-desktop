@@ -11,8 +11,10 @@ pub const FILE: &str = "settings.json";
 #[serde(default)]
 pub struct Settings {
     pub export: ExportSettings,
-    /// Unix ms of the last unlock with the master password (quick unlock expires 14 days after it).
-    pub last_password_unlock_at: i64,
+    /// Biometrics / PIN preferences. (The time of the last master-password
+    /// unlock is not here but in the OS credential store, `local_unlock.rs`:
+    /// editing this file must not extend the 14 days.)
+    pub unlock: UnlockSettings,
     /// Check GitHub Releases for a new version once a day.
     pub check_updates: bool,
     pub last_update_check_at: i64,
@@ -25,12 +27,29 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             export: ExportSettings::default(),
-            last_password_unlock_at: 0,
+            unlock: UnlockSettings::default(),
             check_updates: true,
             last_update_check_at: 0,
             ssh_agent: SshAgentSettings::default(),
             quick_access: QuickAccessSettings::default(),
             browser_bridge: BrowserBridgeSettings::default(),
+        }
+    }
+}
+
+/// Unlock preferences (design doc §4.5).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct UnlockSettings {
+    /// "启动时可直接用生物识别解锁": Windows Hello works after a restart
+    /// without a master-password unlock in this run (still within 14 days).
+    pub biometric_at_start: bool,
+}
+
+impl Default for UnlockSettings {
+    fn default() -> Self {
+        Self {
+            biometric_at_start: true,
         }
     }
 }
@@ -162,7 +181,7 @@ mod tests {
         let mut s = Settings::default();
         s.export.enabled = true;
         s.export.folder = "D:\\Backup".into();
-        s.last_password_unlock_at = 42;
+        s.unlock.biometric_at_start = false;
         s.save(dir.path()).unwrap();
         assert_eq!(Settings::load(dir.path()), s);
         // unknown / missing keys
@@ -180,5 +199,13 @@ mod tests {
         assert!(l.quick_access.enabled);
         assert_eq!(l.quick_access.shortcut, DEFAULT_SHORTCUT);
         assert!(!l.browser_bridge.enabled && l.browser_bridge.pairings.is_empty());
+        // biometrics at start: on unless turned off; an old file's last_password_unlock_at is ignored
+        assert!(l.unlock.biometric_at_start);
+        std::fs::write(
+            dir.path().join(FILE),
+            br#"{"last_password_unlock_at":99,"unlock":{"biometric_at_start":false}}"#,
+        )
+        .unwrap();
+        assert!(!Settings::load(dir.path()).unlock.biometric_at_start);
     }
 }

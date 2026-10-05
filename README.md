@@ -8,11 +8,13 @@ NyaPassword 的桌面客户端：Tauri 2 外壳 + 共享界面（`../common/web`
 
 - **完整的密码库界面**：与网页版同一套界面（登录 / 注册、三栏主界面、编辑、生成器、TOTP、附件、导入导出、安全检查、设置），核心在本机原生运行（Argon2 比 WASM 快）。离线也能用主密码解锁。
 - **本地副本**：`<本地应用数据>/app.nya.password/replica.sqlite3`（Windows：`%LOCALAPPDATA%\app.nya.password\`），只有密文。保护 Secret Key 和会话的设备密钥（32 字节随机数）存在系统凭据存储：Windows 凭据管理器 / macOS 钥匙串 / Linux Secret Service；系统凭据存储不可用时退回到同目录的 `device-key.bin`（设置页会提示）。
-- **Windows Hello 快速解锁**：在“设置 → 解锁与锁定”开启。开启时 Windows Hello 创建密钥 `NyaPassword.<账户 ID>` 并对随机 32 字节挑战签名，签名经 HKDF-SHA256 得到包装密钥，包装账户密钥后与挑战一起存到 `quick-unlock.json`。规则：每次启动应用后第一次必须输入主密码；距上次输入主密码超过 14 天也必须输入；Windows Hello 密钥失效（重置 PIN 等）时自动关闭。关闭时删除系统中的密钥和文件。macOS（Touch ID）/ Linux 暂不支持。
+- **Windows Hello 快速解锁**：在“设置 → 解锁与锁定”开启。开启时 Windows Hello 创建密钥 `NyaPassword.<账户 ID>` 并对随机 32 字节挑战签名，签名经 HKDF-SHA256 得到包装密钥，包装账户密钥后与挑战一起存到 `quick-unlock.json`。“启动时可直接用生物识别解锁”（默认开）：应用重启后也可以直接用 Windows Hello；关掉则每次启动后第一次要输入主密码。Windows Hello 密钥不见了（重置 Windows Hello）或解不开包装时自动关闭并要求主密码。关闭时删除系统中的密钥和文件。macOS（Touch ID）/ Linux 暂不支持。
+- **PIN 解锁**：“设置 → 解锁与锁定 → PIN 解锁”设置 / 修改 / 删除。PIN 至少 4 个字符（任意字符）；核心用 `Argon2id(NFKD(PIN), 随机盐, 账户的 KDF 参数)` 包装账户密钥，结果和尝试次数一起存进 Windows 凭据管理器（条目 `app.nya.password` / `unlock-guard`，DPAPI 保护，不在任何文件里，不上传）。每次尝试前先把次数写回，连续 5 次错误删除 PIN；锁屏的 PIN 输入框显示剩余次数。设备密钥退回到 `device-key.bin` 文件时不能设置 PIN。重启后可用。
+- **14 天规则**：Windows Hello 和 PIN 都只在距上次在本机输入主密码不到 14 天时可用，到期后暂停（锁屏会说明原因），输入主密码即恢复。上次输入主密码的时间和 PIN 在同一条凭据存储记录里，改 `settings.json` 不能延长；系统时间比应用见过的最晚时间早 10 分钟以上也会暂停。在本机修改主密码后，Windows Hello 和 PIN 都被清除，需要重新设置。规格见 [加密规格.md](../common/docs/加密规格.md) §4.4、§4.5，风险见 [威胁模型.md](../common/docs/威胁模型.md) §3.8.2。
 - **托盘与后台**：关闭窗口只是隐藏到托盘；托盘菜单：显示 / 隐藏、锁定、立即同步、退出。单实例（再次启动只会把已有窗口调到前面）。可设置开机启动（直接最小化到托盘）。
 - **自动锁定**：空闲超时（界面设置）、系统锁屏 / 注销 / 切换用户 / 休眠时立即锁定（Windows：WTS 会话通知 + 电源广播）。锁定会清掉解密数据和尚未确认的导入。
 - **剪贴板**：复制的密码 90 秒后（若剪贴板里仍是它）以及退出应用时清除；Windows 上同时设置 `ExcludeClipboardContentFromMonitorProcessing`、`CanIncludeInClipboardHistory = 0`、`CanUploadToCloudClipboard = 0`，不进剪贴板历史、不上传云剪贴板。
-- **使用前需要验证**：条目设置了“使用前需要验证”（编辑页勾选；从 Bitwarden 导入的“主密码重新提示”自动转换）时，密码库在验证前只显示标题、用户名和网址；查看、复制、编辑前输入主密码或使用 Windows Hello。开启了 Windows Hello 快速解锁时用同一个 Hello 密钥签名并核对账户密钥，否则只做 Windows Hello 在场确认；主密码总是可用。验证只对当前打开的条目有效，换条目或锁定后失效。快捷搜索、SSH agent 见下。说明见 [威胁模型.md](../common/docs/威胁模型.md) §3.8.1。
+- **使用前需要验证**：条目设置了“使用前需要验证”（编辑页勾选；从 Bitwarden 导入的“主密码重新提示”自动转换）时，密码库在验证前只显示标题、用户名和网址；查看、复制、编辑前输入主密码、PIN 或使用 Windows Hello。开启了 Windows Hello 快速解锁时用同一个 Hello 密钥签名并核对账户密钥，否则只做 Windows Hello 在场确认；PIN 由核心核对，输错同样计入 5 次；PIN 和 Hello 受 14 天规则约束，主密码总是可用。验证只对当前打开的条目有效，换条目或锁定后失效。快捷搜索、SSH agent 见下。说明见 [威胁模型.md](../common/docs/威胁模型.md) §3.8.1。
 - **快捷搜索与自动输入**、**SSH agent**、**浏览器扩展联动**（见下，都在“设置”里开关）。
 - **定期离线导出**（见下）。
 - **自更新**（见下）。
@@ -26,7 +28,7 @@ NyaPassword 的桌面客户端：Tauri 2 外壳 + 共享界面（`../common/web`
 - 打开前记下当前前台窗口（标题 + 进程名），先列出与它匹配的条目：条目网址的主机名 / 可注册域名出现在窗口标题里、条目标题出现在窗口标题里，或程序名（如 `WeChat.exe`）与条目标题相同。输入关键词则搜索全部条目（支持拼音 / 首字母）。
 - **Enter**：切回那个窗口，按条目的“自动输入序列”输入，默认 `{USERNAME}{TAB}{PASSWORD}{ENTER}`。序列在条目编辑页“自动输入”里设置（存为条目的 `autofill.auto_type`，见条目格式.md），可用 `{USERNAME}` `{PASSWORD}` `{TOTP}` `{URL}` `{TITLE}` `{S:字段名}`、按键 `{TAB}` `{ENTER}` `{SPACE}` `{BS}` `{DEL}` `{ESC}` `{UP}` `{DOWN}` `{LEFT}` `{RIGHT}` `{HOME}` `{END}`、`{DELAY 500}`，`{{}` / `{}}` 表示花括号，其他文字原样输入。
 - **Ctrl+U / Ctrl+P / Ctrl+T**：复制用户名 / 密码 / 验证码（秘密 90 秒后清除），Esc 关闭。
-- “使用前需要验证”的条目：自动输入、复制密码 / 验证码前，在快捷搜索窗口里输入主密码或使用 Windows Hello；一次验证只放行一次。
+- “使用前需要验证”的条目：自动输入、复制密码 / 验证码前，在快捷搜索窗口里输入主密码、PIN 或使用 Windows Hello；一次验证只放行一次。
 - Windows 用 `SendInput` + `KEYEVENTF_UNICODE` 逐字输入，与键盘布局、输入法无关（中文、emoji 都可以）；输入前等 Ctrl / Shift / Alt 松开，**每个字符前都确认目标窗口仍在前台**，焦点变了立即停止。以管理员身份运行的程序会拦截普通程序的输入（UIPI），这时会提示。
 - macOS（CGEvent）/ Linux（X11 XTest）的自动输入**尚未实现**：快捷搜索可以用，只能复制，界面会说明。
 
@@ -35,7 +37,7 @@ NyaPassword 的桌面客户端：Tauri 2 外壳 + 共享界面（`../common/web`
 “设置 → SSH agent”开启后，桌面端用 OpenSSH agent 协议提供保险库中 **SSH 密钥**条目的私钥（解锁的所有保险库；条目编辑页可取消“提供给桌面端的 SSH agent”）。不能通过协议添加密钥。
 
 - **每次签名都弹出确认窗口**：密钥名、用途（SSH 登录的用户名和服务器主机密钥指纹 / Git 提交签名）、请求的程序（及其父进程，如 `ssh-keygen.exe（git.exe）`）。可选“允许一次”“锁定前都允许”“拒绝”；关窗口或 60 秒不处理 = 拒绝。条目关闭“每次签名都确认”时，每次解锁只确认一次。
-- 条目设置了“使用前需要验证”的密钥：每次签名都要在确认窗口里输入主密码或使用 Windows Hello，没有“锁定前都允许”，也不受“每次签名都确认”关闭的影响。
+- 条目设置了“使用前需要验证”的密钥：每次签名都要在确认窗口里输入主密码、PIN 或使用 Windows Hello，没有“锁定前都允许”，也不受“每次签名都确认”关闭的影响。
 - 锁定时收到请求：弹出主窗口提示解锁，最多等 60 秒。
 - 签名算法：Ed25519、ECDSA（P-256 / P-384）、RSA（`rsa-sha2-256` / `rsa-sha2-512`；不做 SHA-1 的 `ssh-rsa`）。
 
@@ -88,7 +90,12 @@ fi
 
 ### 浏览器扩展联动（Native Messaging）
 
-配对后：桌面端已解锁时，扩展打开弹窗 / 内联菜单即可解锁，不用再输主密码；桌面端锁定时，已连接的扩展跟着锁定；桌面端解锁时，已连接的扩展也会解锁。
+配对后：
+
+- 桌面端已解锁时，扩展打开弹窗 / 内联菜单即可解锁，不用再输主密码。
+- 桌面端锁定时，在扩展里**打开弹窗**或**点输入框里的 NyaPassword 按钮**（以及菜单里的“用桌面端解锁”），桌面端会把自己的主窗口（正常的解锁界面）调到前台并聚焦，界面上注明是哪个浏览器在请求；用主密码、Windows Hello 或 PIN 解锁后，扩展也跟着解锁。最多等 2 分钟，同一时间只等一个请求；扩展在等待时显示“请在 NyaPassword 桌面端完成解锁”，主密码输入框照常可用。内联菜单自己弹出、页面加载时不会把桌面端弹出来（只在桌面端已解锁时顺带解锁）。
+- 桌面端没有运行时，上面的明确操作会让 Native Messaging 宿主以普通方式启动桌面端（单实例），再转发这次请求；其他请求只回答“桌面端没有运行”。
+- 桌面端锁定时，已连接的扩展跟着锁定；桌面端解锁时，已连接的扩展也会解锁。
 
 1. 扩展弹窗 ⚙ → 打开“由桌面端解锁”（浏览器会请求 `nativeMessaging` 权限），复制显示的**扩展 ID**。
 2. 桌面端“设置 → 浏览器扩展联动”：填入扩展 ID（每行一个，Chrome 和 Edge 的 ID 不同时都填），开启。桌面端注册 Native Messaging 宿主：清单写到 `<应用数据目录>\native-messaging\app.nya.password.json`（`allowed_origins` = 这些扩展），注册表 `HKCU\Software\Google\Chrome\NativeMessagingHosts\app.nya.password`、`HKCU\Software\Microsoft\Edge\...`、`HKCU\Software\Chromium\...` 指向它；macOS / Linux（实验性）写到各浏览器的 `NativeMessagingHosts` 目录。关闭时删除注册；卸载程序也会删除（NSIS 钩子 `src-tauri/windows/hooks.nsh`）；应用每次启动会重新注册，保证指向当前程序。
@@ -104,7 +111,7 @@ fi
 
 导出需要主密码，而本应用**从不保存主密码**，所以做法是“到期提醒 + 一键完成”：
 
-- 到期后，下一次**用主密码解锁**（或登录）时，应用趁这次解锁调用里主密码本来就在内存中，在后台完成导出，完成后立即丢弃；界面会提示成功或失败。用 Windows Hello 解锁时没有主密码，不会导出——但每次启动后第一次总是要输入主密码，所以不会拖太久。
+- 到期后，下一次**用主密码解锁**（或登录）时，应用趁这次解锁调用里主密码本来就在内存中，在后台完成导出，完成后立即丢弃；界面会提示成功或失败。用 Windows Hello 或 PIN 解锁时没有主密码，不会导出——但至少每 14 天要输入一次主密码，所以不会拖太久（想准时导出就在设置里“立即导出”）。
 - 也可以在设置里输入主密码“立即导出”。
 - 原生格式需要主密码 + Secret Key 才能打开（无损，可再导入 NyaPassword）；KDBX 只用主密码保护，KeePassXC 可直接打开，是“软件都不在了”时的逃生通道。导出文件夹建议放在加密盘或离线介质上。
 
@@ -124,8 +131,9 @@ desktop/
 │  └─ src/
 │     ├─ commands.rs     与界面 Bridge 接口一一对应的命令 + 桌面端设置 / 导出 / 更新
 │     ├─ pure.rs         同步函数（TOTP、生成器、强度……）走 npwsync: 协议
-│     ├─ quick_unlock.rs 快速解锁的密钥包装与规则
-│     ├─ verify.rs       使用前需要验证：主密码 / Windows Hello 再次验证（不改变锁定状态）
+│     ├─ quick_unlock.rs Windows Hello 快速解锁的密钥包装
+│     ├─ local_unlock.rs 14 天规则、PIN 材料与尝试次数（存在系统凭据存储）
+│     ├─ verify.rs       使用前需要验证：主密码 / PIN / Windows Hello 再次验证（不改变锁定状态）
 │     ├─ export.rs       定期离线导出与清理
 │     ├─ updater.rs      自更新（minisign + SHA-256）
 │     ├─ device_key.rs   设备密钥
@@ -150,7 +158,7 @@ npm ci --prefix ..\common\web
 npm ci
 npm run dev                  # vite --mode desktop（5180 端口）+ tauri dev
 npm run web                  # 只构建界面（cargo build / test 前需要它，Rust 会把界面嵌入程序）
-cargo test --workspace       # 单元测试：快速解锁包装、导出清理、更新签名校验、设备密钥……
+cargo test --workspace       # 单元测试：快速解锁包装、14 天规则与 PIN 计数、扩展联动的等待解锁 / 启动桌面端、导出清理、更新签名校验、设备密钥……
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check            # 不要加 --all：那会连 ../common 的 path 依赖一起格式化
 ```

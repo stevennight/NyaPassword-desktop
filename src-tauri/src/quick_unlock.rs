@@ -4,8 +4,10 @@
 //! the account key AK. The challenge and the wrapped AK are stored in
 //! `quick-unlock.json`; the signature exists only while unlocking.
 //!
-//! Rules: offered only after a master-password unlock in this app run, and
-//! only within 14 days of the last master-password unlock.
+//! Rules (`local_unlock.rs`): only within 14 days of the last master-password
+//! unlock on this device, and after a restart only when "启动时可直接用生物识别
+//! 解锁" is on (the default). A Hello key that is gone (Hello reset) or no
+//! longer opens the wrapped key turns quick unlock off.
 
 use std::path::Path;
 
@@ -16,7 +18,6 @@ use sha2::Sha256;
 use zeroize::Zeroizing;
 
 pub const FILE: &str = "quick-unlock.json";
-pub const MAX_AGE_MS: i64 = 14 * 24 * 60 * 60 * 1000;
 const HKDF_INFO: &[u8] = b"npw/desktop/quick-unlock/v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -89,14 +90,6 @@ pub fn unwrap(s: &Stored, signature: &[u8]) -> Result<Zeroizing<Vec<u8>>, String
     .map_err(|_| "快速解锁密钥已失效，请用主密码解锁后重新开启".to_string())
 }
 
-/// May the user unlock without the master password right now?
-pub fn allowed(password_unlock_this_run: bool, last_password_unlock_ms: i64, now_ms: i64) -> bool {
-    password_unlock_this_run
-        && last_password_unlock_ms > 0
-        && now_ms >= last_password_unlock_ms
-        && now_ms - last_password_unlock_ms < MAX_AGE_MS
-}
-
 pub fn load(dir: &Path) -> Option<Stored> {
     let b = std::fs::read(dir.join(FILE)).ok()?;
     serde_json::from_slice(&b).ok()
@@ -148,21 +141,6 @@ mod tests {
         assert_eq!(a, wrapping_key(b"signature", b"challenge-1"));
         assert_ne!(a, wrapping_key(b"signature", b"challenge-2"));
         assert_ne!(a, wrapping_key(b"signaturf", b"challenge-1"));
-    }
-
-    #[test]
-    fn rules() {
-        let day = 24 * 60 * 60 * 1000;
-        let now = 100 * day;
-        assert!(allowed(true, now - day, now));
-        assert!(
-            !allowed(false, now - day, now),
-            "needs a password unlock in this run"
-        );
-        assert!(!allowed(true, now - 14 * day, now), "expires after 14 days");
-        assert!(allowed(true, now - 14 * day + 1, now));
-        assert!(!allowed(true, 0, now));
-        assert!(!allowed(true, now + day, now), "clock went backwards");
     }
 
     #[test]

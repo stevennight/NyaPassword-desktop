@@ -63,15 +63,17 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, FindWindowW, GetForegroundWindow,
-    GetMessageW, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
-    IsWindow, RegisterClassW, SetForegroundWindow, ShowWindow, TranslateMessage, MSG,
-    PBT_APMSUSPEND, SW_RESTORE, WINDOW_EX_STYLE, WM_POWERBROADCAST, WM_WTSSESSION_CHANGE,
-    WNDCLASSW, WS_OVERLAPPED, WTS_CONSOLE_DISCONNECT, WTS_REMOTE_DISCONNECT, WTS_SESSION_LOCK,
-    WTS_SESSION_LOGOFF,
+    AllowSetForegroundWindow, CreateWindowExW, DefWindowProcW, DispatchMessageW, FindWindowW,
+    GetForegroundWindow, GetMessageW, GetWindowTextLengthW, GetWindowTextW,
+    GetWindowThreadProcessId, IsIconic, IsWindow, RegisterClassW, SetForegroundWindow, ShowWindow,
+    TranslateMessage, ASFW_ANY, MSG, PBT_APMSUSPEND, SW_RESTORE, WINDOW_EX_STYLE,
+    WM_POWERBROADCAST, WM_WTSSESSION_CHANGE, WNDCLASSW, WS_OVERLAPPED, WTS_CONSOLE_DISCONNECT,
+    WTS_REMOTE_DISCONNECT, WTS_SESSION_LOCK, WTS_SESSION_LOGOFF,
 };
 
-use super::{LockCallback, Platform, SystemAgent, TargetWindow, MINIMIZED_ARG, NATIVE_HOST_NAME};
+use super::{
+    LockCallback, Platform, QuickError, SystemAgent, TargetWindow, MINIMIZED_ARG, NATIVE_HOST_NAME,
+};
 use crate::autotype::{Key, Step};
 
 pub struct Windows;
@@ -99,19 +101,51 @@ impl Platform for Windows {
         )
         .and_then(|op| op.join())
         .map_err(|e| format!("Windows Hello：{}", e.message()))?;
-        check_status(res.Status().map_err(|e| e.message())?)?;
+        check_status(res.Status().map_err(|e| e.message())?).map_err(|e| e.to_string())?;
         let cred = res.Credential().map_err(|e| e.message())?;
+        sign(&cred, challenge).map_err(|e| e.to_string())
+    }
+
+    fn quick_unlock_sign(&self, name: &str, challenge: &[u8]) -> Result<Vec<u8>, QuickError> {
+        let _focus = PromptFocus::start();
+        let other =
+            |e: windows::core::Error| QuickError::Other(format!("Windows Hello：{}", e.message()));
+        let res = KeyCredentialManager::OpenAsync(&HSTRING::from(name))
+            .and_then(|op| op.join())
+            .map_err(other)?;
+        check_status(res.Status().map_err(other)?)?;
+        let cred = res.Credential().map_err(other)?;
         sign(&cred, challenge)
     }
 
-    fn quick_unlock_sign(&self, name: &str, challenge: &[u8]) -> Result<Vec<u8>, String> {
-        let _focus = PromptFocus::start();
-        let res = KeyCredentialManager::OpenAsync(&HSTRING::from(name))
-            .and_then(|op| op.join())
-            .map_err(|e| format!("Windows Hello：{}", e.message()))?;
-        check_status(res.Status().map_err(|e| e.message())?)?;
-        let cred = res.Credential().map_err(|e| e.message())?;
-        sign(&cred, challenge)
+    fn allow_app_foreground(&self) {
+        // the browser (foreground) started this host: pass the right on to the app
+        if let Err(e) = unsafe { AllowSetForegroundWindow(ASFW_ANY) } {
+            log::info!("AllowSetForegroundWindow: {}", e.message());
+        }
+    }
+
+    fn launch_app(&self) -> Result<(), String> {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let start = |flags: u32| {
+            std::process::Command::new(&exe)
+                .creation_flags(flags)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .map(drop)
+        };
+        // the browser may run its hosts in a job that is closed with them:
+        // leave it when allowed, so the app outlives this host
+        let base = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+        start(base | CREATE_BREAKAWAY_FROM_JOB)
+            .or_else(|_| start(base))
+            .map_err(|e| e.to_string())
     }
 
     fn quick_unlock_delete(&self, name: &str) {
@@ -659,31 +693,35 @@ const APPROVED_KEY: PCWSTR =
     w!(r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run");
 const RUN_VALUE: PCWSTR = w!("NyaPassword");
 
-fn check_status(s: KeyCredentialStatus) -> Result<(), String> {
+fn check_status(s: KeyCredentialStatus) -> Result<(), QuickError> {
+    let other = |m: &str| Err(QuickError::Other(m.into()));
     match s {
         KeyCredentialStatus::Success => Ok(()),
-        KeyCredentialStatus::UserCanceled => Err("已取消 Windows Hello 验证".into()),
-        KeyCredentialStatus::NotFound => Err(
+        KeyCredentialStatus::UserCanceled => other("已取消 Windows Hello 验证"),
+        // the key is gone: Windows Hello was reset or the key deleted
+        KeyCredentialStatus::NotFound => Err(QuickError::Invalidated(
             "找不到 Windows Hello 密钥（可能已重置 PIN 或生物识别），请用主密码解锁后重新开启"
                 .into(),
-        ),
-        KeyCredentialStatus::UserPrefersPassword => Err("请用主密码解锁".into()),
-        KeyCredentialStatus::SecurityDeviceLocked => Err("安全设备已锁定，请稍后再试".into()),
-        KeyCredentialStatus::CredentialAlreadyExists => Err("Windows Hello 密钥已存在".into()),
-        _ => Err("Windows Hello 不可用（请在系统设置中设置 PIN 或生物识别）".into()),
+        )),
+        KeyCredentialStatus::UserPrefersPassword => other("请用主密码解锁"),
+        KeyCredentialStatus::SecurityDeviceLocked => other("安全设备已锁定，请稍后再试"),
+        KeyCredentialStatus::CredentialAlreadyExists => other("Windows Hello 密钥已存在"),
+        _ => other("Windows Hello 不可用（请在系统设置中设置 PIN 或生物识别）"),
     }
 }
 
-fn sign(cred: &KeyCredential, challenge: &[u8]) -> Result<Vec<u8>, String> {
-    let buf = CryptographicBuffer::CreateFromByteArray(challenge).map_err(|e| e.message())?;
+fn sign(cred: &KeyCredential, challenge: &[u8]) -> Result<Vec<u8>, QuickError> {
+    let other =
+        |e: windows::core::Error| QuickError::Other(format!("Windows Hello：{}", e.message()));
+    let buf = CryptographicBuffer::CreateFromByteArray(challenge).map_err(other)?;
     let res = cred
         .RequestSignAsync(&buf)
         .and_then(|op| op.join())
-        .map_err(|e| format!("Windows Hello：{}", e.message()))?;
-    check_status(res.Status().map_err(|e| e.message())?)?;
-    let out = res.Result().map_err(|e| e.message())?;
+        .map_err(other)?;
+    check_status(res.Status().map_err(other)?)?;
+    let out = res.Result().map_err(other)?;
     let mut arr = Array::<u8>::new();
-    CryptographicBuffer::CopyToByteArray(&out, &mut arr).map_err(|e| e.message())?;
+    CryptographicBuffer::CopyToByteArray(&out, &mut arr).map_err(other)?;
     Ok(arr.to_vec())
 }
 

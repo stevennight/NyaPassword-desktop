@@ -53,6 +53,25 @@ pub const NATIVE_HOST_NAME: &str = "app.nya.password";
 
 pub const UNSUPPORTED_AUTOTYPE: &str =
     "此平台暂不支持自动输入（目前只支持 Windows），请使用复制用户名 / 密码";
+
+/// Why the OS quick-unlock key could not sign.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuickError {
+    /// The key is gone for good (Windows Hello reset, the key deleted):
+    /// quick unlock is turned off and the master password is needed.
+    Invalidated(String),
+    /// Cancelled, busy or unavailable for now: try again later.
+    Other(String),
+}
+
+impl std::fmt::Display for QuickError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QuickError::Invalidated(m) | QuickError::Other(m) => f.write_str(m),
+        }
+    }
+}
+
 pub trait Platform: Send + Sync {
     // ------------------------------------------------------------ device key
 
@@ -76,6 +95,32 @@ pub trait Platform: Send + Sync {
             .map_err(|e| e.to_string())
     }
 
+    /// Another small secret in the same store as the device key (the
+    /// unlock guard with the PIN material, `local_unlock.rs`).
+    /// `Ok(None)`: no such entry.
+    fn load_secret(&self, name: &str) -> Result<Option<Vec<u8>>, String> {
+        let entry = keyring::Entry::new(KEYRING_SERVICE, name).map_err(|e| e.to_string())?;
+        match entry.get_secret() {
+            Ok(k) => Ok(Some(k)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    fn store_secret(&self, name: &str, data: &[u8]) -> Result<(), String> {
+        keyring::Entry::new(KEYRING_SERVICE, name)
+            .and_then(|e| e.set_secret(data))
+            .map_err(|e| e.to_string())
+    }
+
+    fn delete_secret(&self, name: &str) -> Result<(), String> {
+        let entry = keyring::Entry::new(KEYRING_SERVICE, name).map_err(|e| e.to_string())?;
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
     // ------------------------------------------------------------ quick unlock
 
     /// Shown in the UI ("使用 Windows Hello 解锁").
@@ -93,8 +138,8 @@ pub trait Platform: Send + Sync {
     }
 
     /// Signs `challenge` with the existing OS key `name` (prompts the user).
-    fn quick_unlock_sign(&self, _name: &str, _challenge: &[u8]) -> Result<Vec<u8>, String> {
-        Err("此平台暂不支持快速解锁".into())
+    fn quick_unlock_sign(&self, _name: &str, _challenge: &[u8]) -> Result<Vec<u8>, QuickError> {
+        Err(QuickError::Other("此平台暂不支持快速解锁".into()))
     }
 
     fn quick_unlock_delete(&self, _name: &str) {}
@@ -204,6 +249,24 @@ pub trait Platform: Send + Sync {
         for dir in unix_native_host_dirs() {
             let _ = std::fs::remove_file(dir.join(format!("{NATIVE_HOST_NAME}.json")));
         }
+    }
+
+    /// Host mode, just before an interactive unlock request goes to the app:
+    /// lets the app take the foreground (Windows only lets the foreground
+    /// process, here the browser's host, pass that right on).
+    fn allow_app_foreground(&self) {}
+
+    /// Host mode: starts the app (normal start, single instance) when an
+    /// interactive unlock request finds it not running.
+    fn launch_app(&self) -> Result<(), String> {
+        let exe = self.native_host_exe()?;
+        std::process::Command::new(exe)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map(drop)
+            .map_err(|e| e.to_string())
     }
 
     /// The executable the browser starts as the host.

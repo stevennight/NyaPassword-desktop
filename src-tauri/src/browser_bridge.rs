@@ -15,22 +15,33 @@
 //!   (also shown by the extension, [`pairing_code`]); only if the user allows
 //!   it, and only for the account this app is signed in to, is the key stored
 //!   (`settings.json`, public data only) → `paired`.
-//! - `unlock {pairing_id, account_id, server_url, nonce}`: if this app is
-//!   unlocked and the pairing belongs to this extension and this account, the
-//!   account key is sealed to the pairing key ([`seal`]: ephemeral ECDH P-256,
-//!   HKDF-SHA256 salted with the extension's nonce, AES-256-GCM) → `unlock
-//!   {eph_public_key, iv, ciphertext}`. The extension opens it with its
-//!   non-extractable WebCrypto key and calls `unlockWithKey`, which itself
-//!   checks the key against the account (a wrong key cannot unlock anything).
+//! - `unlock {pairing_id, account_id, server_url, nonce, interactive?}`: if
+//!   the pairing belongs to this extension and this account and this app is
+//!   unlocked, the account key is sealed to the pairing key ([`seal`]:
+//!   ephemeral ECDH P-256, HKDF-SHA256 salted with the extension's nonce,
+//!   AES-256-GCM) → `unlock {eph_public_key, iv, ciphertext}`. The extension
+//!   opens it with its non-extractable WebCrypto key and calls
+//!   `unlockWithKey`, which itself checks the key against the account (a
+//!   wrong key cannot unlock anything).
+//!   While this app is locked: `locked`, unless `interactive` (the user
+//!   opened the popup or clicked in the inline menu). Then the app brings its
+//!   own unlock screen to the front (master password, Windows Hello or PIN,
+//!   the user's choice) and answers once it is unlocked; `timeout` after
+//!   [`UNLOCK_WAIT`], `busy` while another such request waits (one at a time).
 //! - `unpair {pairing_id}` → `unpaired`.
 //! - Pushed by the app: `{type: "locked"}` when it locks, `{type: "unlocked"}`
 //!   when it unlocks.
 //!
 //! The host process forwards the extension origin Chrome gives it as a first
 //! `_origin` frame; the app also checks it against the allowed extension IDs.
+//! When the app is not running, the host answers `app_not_running`, except to
+//! an interactive `unlock`: it starts the app and relays that request to it
+//! ([`host_without_app`]).
 
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -42,7 +53,7 @@ use p256::elliptic_curve::sec1::ToEncodedPoint;
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{broadcast, mpsc};
 use zeroize::Zeroizing;
@@ -51,7 +62,7 @@ use crate::ipc::{self, Listener};
 use crate::platform::NATIVE_HOST_NAME;
 use crate::prompts::{Decision, PromptInfo};
 use crate::settings::Pairing;
-use crate::state::{now_ms, AppState};
+use crate::state::{now_ms, show_main, AppState, EVENT_UNLOCK_REQUEST};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 const UNLOCK_INFO: &[u8] = b"npw/browser-bridge/unlock/v1";
@@ -59,6 +70,68 @@ const PAIR_INFO: &[u8] = b"npw/browser-bridge/pair/v1";
 /// Largest message either way (Chrome's limit towards the browser is 1 MB).
 const MAX_MESSAGE: usize = 64 * 1024;
 const PAIR_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long an interactive unlock request waits for the user to unlock the app.
+pub const UNLOCK_WAIT: Duration = Duration::from_secs(120);
+/// Host mode: how long to wait for an app it started to accept connections.
+const APP_START_WAIT: Duration = Duration::from_secs(30);
+
+// ---------------------------------------------------------------- waiting for an unlock
+
+/// One interactive unlock request at a time, woken by every unlock of the app.
+#[derive(Default)]
+pub struct UnlockWait {
+    pending: AtomicBool,
+    unlocks: Mutex<u64>,
+    cv: Condvar,
+}
+
+/// The slot of the one pending request; freed on drop.
+pub struct Pending<'a>(&'a UnlockWait);
+
+impl Drop for Pending<'_> {
+    fn drop(&mut self) {
+        self.0.pending.store(false, Ordering::SeqCst);
+    }
+}
+
+impl UnlockWait {
+    /// Takes the slot, or `None` while another request waits.
+    pub fn begin(&self) -> Option<Pending<'_>> {
+        self.pending
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| Pending(self))
+    }
+
+    #[cfg(test)]
+    pub fn is_pending(&self) -> bool {
+        self.pending.load(Ordering::SeqCst)
+    }
+
+    /// The app was unlocked.
+    pub fn notify(&self) {
+        *self.unlocks.lock().expect("unlocks") += 1;
+        self.cv.notify_all();
+    }
+
+    /// Blocks until `ready()` (re-checked on every [`UnlockWait::notify`] and
+    /// at least every 250 ms) or `timeout`; whether it became ready.
+    pub fn wait_until(&self, timeout: Duration, ready: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut g = self.unlocks.lock().expect("unlocks");
+        loop {
+            if ready() {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let step = (deadline - now).min(Duration::from_millis(250));
+            g = self.cv.wait_timeout(g, step).expect("unlocks").0;
+        }
+    }
+}
 
 // ---------------------------------------------------------------- crypto
 
@@ -173,6 +246,14 @@ pub trait Host: Send + Sync + 'static {
     fn touch_pairing(&self, id: &str);
     /// Asks the user (blocking); `true` = allowed.
     fn confirm_pairing(&self, browser: &str, extension_id: &str, code: &str) -> bool;
+    /// `active`: brings the app's own unlock screen to the front and focuses
+    /// it, saying that the extension `browser` asks; `false`: the request ended.
+    fn show_unlock(&self, browser: &str, active: bool);
+    /// Woken by every unlock of the app.
+    fn unlock_wait(&self) -> &UnlockWait;
+    fn unlock_timeout(&self) -> Duration {
+        UNLOCK_WAIT
+    }
 }
 
 fn error(code: &str, message: &str) -> Value {
@@ -293,8 +374,33 @@ fn pair<H: Host + ?Sized>(host: &H, extension_id: &str, req: &Value) -> Result<V
     Ok(json!({"type": "paired", "id": id}))
 }
 
+/// Whether a request asks the locked app to show its unlock screen.
+pub fn is_interactive_unlock(req: &Value) -> bool {
+    req["type"] == "unlock" && req["interactive"] == true
+}
+
+/// Shows the app's unlock screen and waits (one request at a time) until the
+/// user unlocks it. The new lock state, or `busy` / `timeout`.
+fn wait_for_unlock<H: Host + ?Sized>(host: &H, browser: &str) -> Result<LockState, Value> {
+    let w = host.unlock_wait();
+    let Some(_slot) = w.begin() else {
+        return Err(error(
+            "busy",
+            "桌面端正在等待解锁（另一个请求），请在桌面端完成解锁",
+        ));
+    };
+    host.show_unlock(browser, true);
+    let unlocked = w.wait_until(host.unlock_timeout(), || host.lock_state().unlocked);
+    host.show_unlock(browser, false);
+    if unlocked {
+        Ok(host.lock_state())
+    } else {
+        Err(error("timeout", "桌面端没有在 2 分钟内解锁"))
+    }
+}
+
 fn unlock<H: Host + ?Sized>(host: &H, extension_id: &str, req: &Value) -> Result<Value, Value> {
-    let st = host.lock_state();
+    let mut st = host.lock_state();
     same_account(&st, req)?;
     let pid = req["pairing_id"].as_str().unwrap_or_default();
     let pairing = host
@@ -302,11 +408,17 @@ fn unlock<H: Host + ?Sized>(host: &H, extension_id: &str, req: &Value) -> Result
         .into_iter()
         .find(|p| p.id == pid && p.extension_id == extension_id && p.account_id == st.account_id)
         .ok_or_else(|| error("not_paired", "这个扩展还没有与桌面端配对"))?;
-    if !st.unlocked {
-        return Err(error("locked", "NyaPassword 桌面端已锁定"));
-    }
     let nonce = b64_arg(req, "nonce")?;
     check_nonce(&nonce).map_err(|e| error("invalid", &e))?;
+    if !st.unlocked {
+        // only an explicit action in the extension may bring the app forward
+        if !is_interactive_unlock(req) {
+            return Err(error("locked", "NyaPassword 桌面端已锁定"));
+        }
+        st = wait_for_unlock(host, &pairing.name)?;
+        // still the same account (it could have signed out meanwhile)
+        same_account(&st, req)?;
+    }
     let public = B64
         .decode(&pairing.public_key)
         .map_err(|_| error("invalid", "stored key"))?;
@@ -460,6 +572,8 @@ pub struct BrowserBridge {
     events: broadcast::Sender<String>,
     task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     status: Mutex<BridgeStatus>,
+    /// The interactive unlock request waiting for the user (one at a time).
+    pub wait: UnlockWait,
 }
 
 impl Default for BrowserBridge {
@@ -468,6 +582,7 @@ impl Default for BrowserBridge {
             events: broadcast::channel(16).0,
             task: Mutex::new(None),
             status: Mutex::new(BridgeStatus::default()),
+            wait: UnlockWait::default(),
         }
     }
 }
@@ -563,6 +678,27 @@ impl Host for AppHost {
         };
         st.prompts.ask(&self.app, info, PAIR_TIMEOUT) != Decision::Deny
     }
+
+    fn show_unlock(&self, browser: &str, active: bool) {
+        // the lock screen shows who is asking (bridge-tauri.ts)
+        let _ = self
+            .app
+            .emit(EVENT_UNLOCK_REQUEST, if active { browser } else { "" });
+        if !active {
+            return;
+        }
+        show_main(&self.app);
+        if let Some(w) = self.app.get_webview_window("main") {
+            // Windows may refuse the focus to a background app: flash the taskbar then
+            if !w.is_focused().unwrap_or(false) {
+                let _ = w.request_user_attention(Some(tauri::UserAttentionType::Critical));
+            }
+        }
+    }
+
+    fn unlock_wait(&self) -> &UnlockWait {
+        &self.app.state::<AppState>().inner().bridge.wait
+    }
 }
 
 fn manifest(exe: &std::path::Path, extension_ids: &[String]) -> String {
@@ -656,21 +792,49 @@ async fn write_native<W: AsyncWrite + Unpin>(w: &mut W, body: &[u8]) -> std::io:
 
 /// Relays between the browser (`input` / `output`) and the app (`conn`)
 /// until either side closes.
-pub async fn relay<I, O>(
+#[cfg(test)]
+pub async fn relay<I, O>(input: I, output: O, conn: ipc::Conn, origin: &str) -> std::io::Result<()>
+where
+    I: AsyncRead + Unpin + Send + 'static,
+    O: AsyncWrite + Unpin + Send + 'static,
+{
+    relay_with(input, output, conn, origin, None, || {}).await
+}
+
+/// [`relay`], first sending `first` (a request read before the app was
+/// reachable); `on_interactive` runs before each interactive unlock request
+/// goes up (Windows: lets the app take the foreground).
+pub async fn relay_with<I, O>(
     mut input: I,
     mut output: O,
     conn: ipc::Conn,
     origin: &str,
+    first: Option<Vec<u8>>,
+    on_interactive: fn(),
 ) -> std::io::Result<()>
 where
     I: AsyncRead + Unpin + Send + 'static,
     O: AsyncWrite + Unpin + Send + 'static,
 {
+    let interactive = |m: &[u8]| {
+        serde_json::from_slice::<Value>(m)
+            .map(|v| is_interactive_unlock(&v))
+            .unwrap_or(false)
+    };
     let (mut r, mut w) = tokio::io::split(conn);
     let hello = json!({"type": "_origin", "origin": origin}).to_string();
     ipc::write_frame(&mut w, hello.as_bytes()).await?;
+    if let Some(m) = first {
+        if interactive(&m) {
+            on_interactive();
+        }
+        ipc::write_frame(&mut w, &m).await?;
+    }
     let up = tokio::spawn(async move {
         while let Ok(Some(m)) = read_native(&mut input).await {
+            if interactive(&m) {
+                on_interactive();
+            }
             if ipc::write_frame(&mut w, &m).await.is_err() {
                 break;
             }
@@ -691,6 +855,73 @@ where
     Ok(())
 }
 
+fn not_running(req: &Value, message: &str) -> Vec<u8> {
+    let mut e = error("app_not_running", message);
+    if let Some(rid) = req.get("rid") {
+        e["rid"] = rid.clone();
+    }
+    e.to_string().into_bytes()
+}
+
+/// Host mode while the app is not running (or not serving the bridge):
+/// answers every request with `app_not_running`, except an interactive
+/// unlock (the user opened the popup / clicked in the inline menu). That one
+/// starts the app (`launch`: a normal start, single instance), waits for it
+/// to accept connections (`connect`) and is then relayed like any request.
+pub async fn host_without_app<I, O, L, C, F>(
+    mut input: I,
+    mut output: O,
+    origin: &str,
+    launch: L,
+    connect: C,
+    start_wait: Duration,
+    on_interactive: fn(),
+) -> std::io::Result<()>
+where
+    I: AsyncRead + Unpin + Send + 'static,
+    O: AsyncWrite + Unpin + Send + 'static,
+    L: Fn() -> Result<(), String>,
+    C: Fn() -> F,
+    F: Future<Output = std::io::Result<ipc::Conn>>,
+{
+    while let Some(m) = read_native(&mut input).await? {
+        // the app may have been started since the last request
+        if let Ok(conn) = connect().await {
+            return relay_with(input, output, conn, origin, Some(m), on_interactive).await;
+        }
+        let req: Value = serde_json::from_slice(&m).unwrap_or(Value::Null);
+        if !is_interactive_unlock(&req) {
+            let e = not_running(&req, "NyaPassword 桌面端没有运行，或没有开启浏览器扩展联动");
+            write_native(&mut output, &e).await?;
+            continue;
+        }
+        // the started app must be allowed to come to the front
+        on_interactive();
+        let started = match launch() {
+            Ok(()) => {
+                let deadline = Instant::now() + start_wait;
+                loop {
+                    match connect().await {
+                        Ok(c) => break Ok(c),
+                        Err(_) if Instant::now() < deadline => {
+                            tokio::time::sleep(Duration::from_millis(250)).await;
+                        }
+                        Err(_) => break Err("桌面端已启动，但没有开启浏览器扩展联动".to_string()),
+                    }
+                }
+            }
+            Err(e) => Err(format!("无法启动 NyaPassword 桌面端：{e}")),
+        };
+        match started {
+            Ok(conn) => {
+                return relay_with(input, output, conn, origin, Some(m), on_interactive).await;
+            }
+            Err(msg) => write_native(&mut output, &not_running(&req, &msg)).await?,
+        }
+    }
+    Ok(())
+}
+
 /// The browser started us as its native messaging host (`origin` =
 /// `chrome-extension://<id>/`). Returns the process exit code.
 pub fn run_host(origin: &str) -> i32 {
@@ -701,25 +932,42 @@ pub fn run_host(origin: &str) -> i32 {
         Ok(rt) => rt,
         Err(_) => return 1,
     };
+    let foreground: fn() = || crate::platform::native().allow_app_foreground();
     rt.block_on(async {
-        let conn = match endpoint() {
-            Ok(ep) => ipc::connect(&ep).await.map_err(|e| e.to_string()),
-            Err(e) => Err(e),
+        let ep = match endpoint() {
+            Ok(ep) => ep,
+            Err(e) => {
+                let e = error("app_not_running", &e).to_string();
+                let _ = write_native(&mut tokio::io::stdout(), e.as_bytes()).await;
+                return 0;
+            }
         };
-        match conn {
+        let _ = match ipc::connect(&ep).await {
             Ok(conn) => {
-                let _ = relay(tokio::io::stdin(), tokio::io::stdout(), conn, origin).await;
-                0
+                relay_with(
+                    tokio::io::stdin(),
+                    tokio::io::stdout(),
+                    conn,
+                    origin,
+                    None,
+                    foreground,
+                )
+                .await
             }
             Err(_) => {
-                let e = error(
-                    "app_not_running",
-                    "NyaPassword 桌面端没有运行，或没有开启浏览器扩展联动",
-                );
-                let _ = write_native(&mut tokio::io::stdout(), e.to_string().as_bytes()).await;
-                0
+                host_without_app(
+                    tokio::io::stdin(),
+                    tokio::io::stdout(),
+                    origin,
+                    || crate::platform::native().launch_app(),
+                    || ipc::connect(&ep),
+                    APP_START_WAIT,
+                    foreground,
+                )
+                .await
             }
-        }
+        };
+        0
     })
 }
 
@@ -808,6 +1056,18 @@ mod tests {
         pairings: Mutex<Vec<Pairing>>,
         allow: bool,
         asked: Mutex<Vec<String>>,
+        wait: UnlockWait,
+        /// (browser, active) of every `show_unlock`.
+        shown: Mutex<Vec<(String, bool)>>,
+        timeout: Duration,
+    }
+
+    impl FakeHost {
+        /// The user unlocks the app (what `AppState::notify_unlocked` does).
+        fn unlock_now(&self) {
+            self.st.lock().unwrap().unlocked = true;
+            self.wait.notify();
+        }
     }
 
     impl Host for FakeHost {
@@ -838,6 +1098,15 @@ mod tests {
             self.asked.lock().unwrap().push(code.into());
             self.allow
         }
+        fn show_unlock(&self, browser: &str, active: bool) {
+            self.shown.lock().unwrap().push((browser.into(), active));
+        }
+        fn unlock_wait(&self) -> &UnlockWait {
+            &self.wait
+        }
+        fn unlock_timeout(&self) -> Duration {
+            self.timeout
+        }
     }
 
     fn host(allow: bool, unlocked: bool) -> FakeHost {
@@ -854,7 +1123,155 @@ mod tests {
             pairings: Mutex::new(vec![]),
             allow,
             asked: Mutex::new(vec![]),
+            wait: UnlockWait::default(),
+            shown: Mutex::new(vec![]),
+            timeout: Duration::from_secs(10),
         }
+    }
+
+    fn sealed_of(r: &Value) -> Sealed {
+        Sealed {
+            eph_public_key: r["eph_public_key"].as_str().unwrap().into(),
+            iv: r["iv"].as_str().unwrap().into(),
+            ciphertext: r["ciphertext"].as_str().unwrap().into(),
+        }
+    }
+
+    fn interactive(nonce: &[u8]) -> Value {
+        let mut r = unlock_req(nonce);
+        r["interactive"] = true.into();
+        r
+    }
+
+    /// Polls until `f` holds (the waiting request runs on another thread).
+    fn eventually(f: impl Fn() -> bool) {
+        let start = Instant::now();
+        while !f() {
+            assert!(start.elapsed() < Duration::from_secs(5), "timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// The desktop app is locked: an interactive request shows the app's
+    /// unlock screen, waits, and is answered once the user unlocks; other
+    /// requests meanwhile are `busy` (interactive) or `locked` (not).
+    #[test]
+    fn locked_desktop_waits_for_an_interactive_unlock() {
+        let ext = ext_key(3);
+        let h = Arc::new(host(true, false));
+        assert_eq!(handle_request(&*h, EXT, &pair_req(&ext))["type"], "paired");
+        let nonce = [7u8; 32];
+        let waiting = {
+            let h = h.clone();
+            std::thread::spawn(move || handle_request(&*h, EXT, &interactive(&nonce)))
+        };
+        eventually(|| h.wait.is_pending());
+        assert_eq!(
+            h.shown.lock().unwrap().as_slice(),
+            [("Chrome".to_string(), true)]
+        );
+        // one at a time
+        assert_eq!(
+            handle_request(&*h, EXT, &interactive(&[8u8; 32]))["code"],
+            "busy"
+        );
+        // automatic requests never wait or show anything
+        assert_eq!(
+            handle_request(&*h, EXT, &unlock_req(&[9u8; 32]))["code"],
+            "locked"
+        );
+        assert_eq!(h.shown.lock().unwrap().len(), 1);
+
+        // the user unlocks the app (password, Windows Hello or PIN)
+        h.unlock_now();
+        let r = waiting.join().unwrap();
+        assert_eq!(r["type"], "unlock", "{r}");
+        assert_eq!(r["rid"], 2);
+        assert_eq!(
+            open(&ext, &sealed_of(&r), "acc-1", &nonce).unwrap(),
+            vec![0xAB; 32]
+        );
+        assert!(!h.wait.is_pending());
+        assert_eq!(
+            h.shown.lock().unwrap().last().unwrap(),
+            &("Chrome".to_string(), false)
+        );
+        // unlocked now: answered at once, nothing shown
+        assert_eq!(
+            handle_request(&*h, EXT, &interactive(&nonce))["type"],
+            "unlock"
+        );
+        assert_eq!(h.shown.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn waiting_times_out_and_frees_the_slot() {
+        let ext = ext_key(3);
+        let mut fake = host(true, false);
+        fake.timeout = Duration::from_millis(300);
+        let h = Arc::new(fake);
+        handle_request(&*h, EXT, &pair_req(&ext));
+        let r = handle_request(&*h, EXT, &interactive(&[1u8; 32]));
+        assert_eq!(r["code"], "timeout");
+        assert!(!h.wait.is_pending());
+        assert_eq!(h.shown.lock().unwrap().len(), 2, "shown, then ended");
+        // a later request may wait again
+        let again = {
+            let h = h.clone();
+            std::thread::spawn(move || handle_request(&*h, EXT, &interactive(&[2u8; 32])))
+        };
+        eventually(|| h.wait.is_pending());
+        h.unlock_now();
+        assert_eq!(again.join().unwrap()["type"], "unlock");
+    }
+
+    #[test]
+    fn only_paired_extensions_of_this_account_can_bring_the_app_forward() {
+        let h = host(true, false);
+        // not paired: refused at once, no window
+        assert_eq!(
+            handle_request(&h, EXT, &interactive(&[1u8; 32]))["code"],
+            "not_paired"
+        );
+        handle_request(&h, EXT, &pair_req(&ext_key(3)));
+        let mut wrong = interactive(&[1u8; 32]);
+        wrong["account_id"] = "acc-2".into();
+        assert_eq!(handle_request(&h, EXT, &wrong)["code"], "account_mismatch");
+        let mut bad_nonce = interactive(&[1u8; 32]);
+        bad_nonce["nonce"] = B64.encode([1u8; 4]).into();
+        assert_eq!(handle_request(&h, EXT, &bad_nonce)["code"], "invalid");
+        assert!(h.shown.lock().unwrap().is_empty());
+        assert!(!h.wait.is_pending());
+    }
+
+    #[test]
+    fn another_account_after_the_wait_gets_nothing() {
+        let h = Arc::new(host(true, false));
+        handle_request(&*h, EXT, &pair_req(&ext_key(3)));
+        let waiting = {
+            let h = h.clone();
+            std::thread::spawn(move || handle_request(&*h, EXT, &interactive(&[5u8; 32])))
+        };
+        eventually(|| h.wait.is_pending());
+        {
+            // the user signed out and into another account meanwhile
+            let mut st = h.st.lock().unwrap();
+            st.account_id = "acc-2".into();
+        }
+        h.unlock_now();
+        assert_eq!(waiting.join().unwrap()["code"], "account_mismatch");
+    }
+
+    #[test]
+    fn interactive_requests_are_recognized() {
+        assert!(is_interactive_unlock(&interactive(&[1u8; 32])));
+        assert!(!is_interactive_unlock(&unlock_req(&[1u8; 32])));
+        let mut s = interactive(&[1u8; 32]);
+        s["interactive"] = "true".into();
+        assert!(!is_interactive_unlock(&s), "only a JSON true");
+        assert!(!is_interactive_unlock(
+            &json!({"type": "hello", "interactive": true})
+        ));
     }
 
     fn pair_req(ext: &p256::SecretKey) -> Value {
@@ -890,13 +1307,8 @@ mod tests {
         let nonce = [5u8; 32];
         let r = handle_request(&h, EXT, &unlock_req(&nonce));
         assert_eq!(r["type"], "unlock", "{r}");
-        let sealed: Sealed = Sealed {
-            eph_public_key: r["eph_public_key"].as_str().unwrap().into(),
-            iv: r["iv"].as_str().unwrap().into(),
-            ciphertext: r["ciphertext"].as_str().unwrap().into(),
-        };
         assert_eq!(
-            open(&ext, &sealed, "acc-1", &nonce).unwrap(),
+            open(&ext, &sealed_of(&r), "acc-1", &nonce).unwrap(),
             vec![0xAB; 32]
         );
 
@@ -1046,6 +1458,144 @@ mod tests {
                 serde_json::from_slice(&read_native(&mut b2).await.unwrap().unwrap()).unwrap();
             assert_eq!(r["code"], "forbidden");
             server.abort();
+        });
+    }
+
+    fn pipe_name(tag: &str) -> String {
+        let n = format!(
+            "npw-test-{tag}-{}-{}",
+            std::process::id(),
+            npw_model::new_id()
+        );
+        if cfg!(windows) {
+            n
+        } else {
+            std::path::Path::new("/tmp").join(n).display().to_string()
+        }
+    }
+
+    async fn ask(browser: &mut tokio::io::DuplexStream, req: Value) -> Value {
+        write_native(browser, req.to_string().as_bytes())
+            .await
+            .unwrap();
+        serde_json::from_slice(&read_native(browser).await.unwrap().unwrap()).unwrap()
+    }
+
+    /// The app is not running: the host answers `app_not_running`, except to
+    /// an interactive unlock, for which it starts the app and relays the
+    /// request once the app listens.
+    #[test]
+    fn host_starts_the_app_for_an_interactive_unlock() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let name = pipe_name("launch");
+            let h = Arc::new(host(true, true));
+            let ext = ext_key(4);
+            handle_request(&*h, EXT, &pair_req(&ext));
+            let (events, _) = broadcast::channel(4);
+            let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+            let launch = {
+                let (name, h, events, launches) =
+                    (name.clone(), h.clone(), events.clone(), launches.clone());
+                move || {
+                    launches.fetch_add(1, Ordering::SeqCst);
+                    // "the app starts": it listens a moment later
+                    let (name, h, events) = (name.clone(), h.clone(), events.clone());
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        let l = Listener::bind(&name).unwrap();
+                        serve(l, h, events).await;
+                    });
+                    Ok(())
+                }
+            };
+            let connect = {
+                let name = name.clone();
+                move || {
+                    let name = name.clone();
+                    async move { ipc::connect(&name).await }
+                }
+            };
+            let (mut browser, stdio) = tokio::io::duplex(1 << 16);
+            let (host_in, host_out) = tokio::io::split(stdio);
+            let origin = format!("chrome-extension://{EXT}/");
+            let task = tokio::spawn(async move {
+                host_without_app(
+                    host_in,
+                    host_out,
+                    &origin,
+                    launch,
+                    connect,
+                    Duration::from_secs(10),
+                    || {},
+                )
+                .await
+            });
+
+            // automatic requests do not start the app
+            let r = ask(&mut browser, json!({"type": "hello", "rid": "a"})).await;
+            assert_eq!(
+                (r["code"].as_str(), r["rid"].as_str()),
+                (Some("app_not_running"), Some("a"))
+            );
+            let r = ask(&mut browser, unlock_req(&[1; 32])).await;
+            assert_eq!(r["code"], "app_not_running");
+            assert_eq!(launches.load(Ordering::SeqCst), 0);
+
+            // an explicit unlock starts it and is answered by it
+            let nonce = [6u8; 32];
+            let r = ask(&mut browser, interactive(&nonce)).await;
+            assert_eq!(r["type"], "unlock", "{r}");
+            assert_eq!(r["rid"], 2);
+            assert_eq!(
+                open(&ext, &sealed_of(&r), "acc-1", &nonce).unwrap(),
+                vec![0xAB; 32]
+            );
+            assert_eq!(launches.load(Ordering::SeqCst), 1);
+            // from now on it is a normal relay: requests and pushed events
+            let r = ask(&mut browser, json!({"type": "hello", "rid": "b"})).await;
+            assert_eq!(r["type"], "hello");
+            events.send("locked".into()).unwrap();
+            let r: Value =
+                serde_json::from_slice(&read_native(&mut browser).await.unwrap().unwrap()).unwrap();
+            assert_eq!(r["type"], "locked");
+            drop(browser);
+            task.await.unwrap().unwrap();
+        });
+    }
+
+    #[test]
+    fn host_reports_an_app_that_cannot_start() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let name = pipe_name("nostart");
+            let (mut browser, stdio) = tokio::io::duplex(1 << 16);
+            let (host_in, host_out) = tokio::io::split(stdio);
+            let task = tokio::spawn(async move {
+                host_without_app(
+                    host_in,
+                    host_out,
+                    "chrome-extension://x/",
+                    || Err("not installed".to_string()),
+                    move || {
+                        let name = name.clone();
+                        async move { ipc::connect(&name).await }
+                    },
+                    Duration::from_millis(200),
+                    || {},
+                )
+                .await
+            });
+            let r = ask(&mut browser, interactive(&[1; 32])).await;
+            assert_eq!(r["code"], "app_not_running");
+            assert_eq!(r["rid"], 2);
+            assert!(r["message"].as_str().unwrap().contains("not installed"));
+            // the host keeps answering
+            let r = ask(&mut browser, json!({"type": "hello", "rid": 9})).await;
+            assert_eq!(r["rid"], 9);
+            drop(browser);
+            task.await.unwrap().unwrap();
         });
     }
 
