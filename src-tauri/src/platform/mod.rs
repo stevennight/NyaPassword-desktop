@@ -59,6 +59,8 @@ pub const UNSUPPORTED_AUTOTYPE: &str =
 pub enum QuickError {
     /// The key is gone for good (Windows Hello reset, the key deleted):
     /// quick unlock is turned off and the master password is needed.
+    /// Only Windows Hello reports it so far (no quick unlock elsewhere yet).
+    #[cfg_attr(not(windows), allow(dead_code))]
     Invalidated(String),
     /// Cancelled, busy or unavailable for now: try again later.
     Other(String),
