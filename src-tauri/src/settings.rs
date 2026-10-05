@@ -72,7 +72,11 @@ pub struct QuickAccessSettings {
     pub shortcut: String,
 }
 
-pub const DEFAULT_SHORTCUT: &str = "Ctrl+Shift+Space";
+/// The shortcut of a new installation. Three modifiers: Ctrl+Shift+Space (the
+/// earlier default) collides with IDE parameter hints (VS Code, JetBrains)
+/// and some input methods, and Ctrl+Alt+<key> is AltGr+<key> on many European
+/// layouts. A shortcut already in settings.json is kept as it is.
+pub const DEFAULT_SHORTCUT: &str = "Ctrl+Shift+Alt+Space";
 
 impl Default for QuickAccessSettings {
     fn default() -> Self {
@@ -207,5 +211,20 @@ mod tests {
         )
         .unwrap();
         assert!(!Settings::load(dir.path()).unlock.biometric_at_start);
+    }
+
+    #[test]
+    fn a_saved_shortcut_is_kept_and_the_default_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(FILE),
+            br#"{"quick_access":{"enabled":true,"shortcut":"Ctrl+Shift+Space"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            Settings::load(dir.path()).quick_access.shortcut,
+            "Ctrl+Shift+Space"
+        );
+        assert!(crate::quick::parse_shortcut(DEFAULT_SHORTCUT).is_ok());
     }
 }

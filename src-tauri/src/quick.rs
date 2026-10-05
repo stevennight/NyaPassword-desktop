@@ -1,5 +1,5 @@
 //! Quick Access (design doc §10.3): a global shortcut (default
-//! Ctrl+Shift+Space) remembers the focused window of another program and
+//! Ctrl+Shift+Alt+Space) remembers the focused window of another program and
 //! opens a small search window (`desktop.html#quick`). Enter auto-types the
 //! chosen login into the remembered window; buttons copy the username,
 //! password or one-time code.
