@@ -20,6 +20,7 @@ mod ssh_agent;
 mod state;
 mod tray;
 mod updater;
+mod verify;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -106,6 +107,8 @@ pub fn run() {
             commands::sign_in,
             commands::unlock,
             commands::lock,
+            commands::verify_user_options,
+            commands::verify_user,
             commands::sign_out,
             commands::emergency_kit,
             commands::quick_unlock_status,
@@ -166,9 +169,11 @@ pub fn run() {
             commands::quick_show_main,
             commands::quick_autotype,
             commands::quick_copy,
+            commands::quick_verify,
             commands::check_auto_type,
             commands::prompt_info,
             commands::prompt_respond,
+            commands::prompt_verify,
         ])
         .build({
             let mut ctx = tauri::generate_context!();

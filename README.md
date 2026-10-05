@@ -12,6 +12,7 @@ NyaPassword 的桌面客户端：Tauri 2 外壳 + 共享界面（`../common/web`
 - **托盘与后台**：关闭窗口只是隐藏到托盘；托盘菜单：显示 / 隐藏、锁定、立即同步、退出。单实例（再次启动只会把已有窗口调到前面）。可设置开机启动（直接最小化到托盘）。
 - **自动锁定**：空闲超时（界面设置）、系统锁屏 / 注销 / 切换用户 / 休眠时立即锁定（Windows：WTS 会话通知 + 电源广播）。锁定会清掉解密数据和尚未确认的导入。
 - **剪贴板**：复制的密码 90 秒后（若剪贴板里仍是它）以及退出应用时清除；Windows 上同时设置 `ExcludeClipboardContentFromMonitorProcessing`、`CanIncludeInClipboardHistory = 0`、`CanUploadToCloudClipboard = 0`，不进剪贴板历史、不上传云剪贴板。
+- **使用前需要验证**：条目设置了“使用前需要验证”（编辑页勾选；从 Bitwarden 导入的“主密码重新提示”自动转换）时，密码库在验证前只显示标题、用户名和网址；查看、复制、编辑前输入主密码或使用 Windows Hello。开启了 Windows Hello 快速解锁时用同一个 Hello 密钥签名并核对账户密钥，否则只做 Windows Hello 在场确认；主密码总是可用。验证只对当前打开的条目有效，换条目或锁定后失效。快捷搜索、SSH agent 见下。说明见 [威胁模型.md](../common/docs/威胁模型.md) §3.8.1。
 - **快捷搜索与自动输入**、**SSH agent**、**浏览器扩展联动**（见下，都在“设置”里开关）。
 - **定期离线导出**（见下）。
 - **自更新**（见下）。
@@ -25,6 +26,7 @@ NyaPassword 的桌面客户端：Tauri 2 外壳 + 共享界面（`../common/web`
 - 打开前记下当前前台窗口（标题 + 进程名），先列出与它匹配的条目：条目网址的主机名 / 可注册域名出现在窗口标题里、条目标题出现在窗口标题里，或程序名（如 `WeChat.exe`）与条目标题相同。输入关键词则搜索全部条目（支持拼音 / 首字母）。
 - **Enter**：切回那个窗口，按条目的“自动输入序列”输入，默认 `{USERNAME}{TAB}{PASSWORD}{ENTER}`。序列在条目编辑页“自动输入”里设置（存为条目的 `autofill.auto_type`，见条目格式.md），可用 `{USERNAME}` `{PASSWORD}` `{TOTP}` `{URL}` `{TITLE}` `{S:字段名}`、按键 `{TAB}` `{ENTER}` `{SPACE}` `{BS}` `{DEL}` `{ESC}` `{UP}` `{DOWN}` `{LEFT}` `{RIGHT}` `{HOME}` `{END}`、`{DELAY 500}`，`{{}` / `{}}` 表示花括号，其他文字原样输入。
 - **Ctrl+U / Ctrl+P / Ctrl+T**：复制用户名 / 密码 / 验证码（秘密 90 秒后清除），Esc 关闭。
+- “使用前需要验证”的条目：自动输入、复制密码 / 验证码前，在快捷搜索窗口里输入主密码或使用 Windows Hello；一次验证只放行一次。
 - Windows 用 `SendInput` + `KEYEVENTF_UNICODE` 逐字输入，与键盘布局、输入法无关（中文、emoji 都可以）；输入前等 Ctrl / Shift / Alt 松开，**每个字符前都确认目标窗口仍在前台**，焦点变了立即停止。以管理员身份运行的程序会拦截普通程序的输入（UIPI），这时会提示。
 - macOS（CGEvent）/ Linux（X11 XTest）的自动输入**尚未实现**：快捷搜索可以用，只能复制，界面会说明。
 
@@ -33,6 +35,7 @@ NyaPassword 的桌面客户端：Tauri 2 外壳 + 共享界面（`../common/web`
 “设置 → SSH agent”开启后，桌面端用 OpenSSH agent 协议提供保险库中 **SSH 密钥**条目的私钥（解锁的所有保险库；条目编辑页可取消“提供给桌面端的 SSH agent”）。不能通过协议添加密钥。
 
 - **每次签名都弹出确认窗口**：密钥名、用途（SSH 登录的用户名和服务器主机密钥指纹 / Git 提交签名）、请求的程序（及其父进程，如 `ssh-keygen.exe（git.exe）`）。可选“允许一次”“锁定前都允许”“拒绝”；关窗口或 60 秒不处理 = 拒绝。条目关闭“每次签名都确认”时，每次解锁只确认一次。
+- 条目设置了“使用前需要验证”的密钥：每次签名都要在确认窗口里输入主密码或使用 Windows Hello，没有“锁定前都允许”，也不受“每次签名都确认”关闭的影响。
 - 锁定时收到请求：弹出主窗口提示解锁，最多等 60 秒。
 - 签名算法：Ed25519、ECDSA（P-256 / P-384）、RSA（`rsa-sha2-256` / `rsa-sha2-512`；不做 SHA-1 的 `ssh-rsa`）。
 
@@ -122,6 +125,7 @@ desktop/
 │     ├─ commands.rs     与界面 Bridge 接口一一对应的命令 + 桌面端设置 / 导出 / 更新
 │     ├─ pure.rs         同步函数（TOTP、生成器、强度……）走 npwsync: 协议
 │     ├─ quick_unlock.rs 快速解锁的密钥包装与规则
+│     ├─ verify.rs       使用前需要验证：主密码 / Windows Hello 再次验证（不改变锁定状态）
 │     ├─ export.rs       定期离线导出与清理
 │     ├─ updater.rs      自更新（minisign + SHA-256）
 │     ├─ device_key.rs   设备密钥

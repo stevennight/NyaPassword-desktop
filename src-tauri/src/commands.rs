@@ -23,6 +23,7 @@ use crate::quick_unlock;
 use crate::settings::{ExportSettings, Pairing};
 use crate::state::{now_ms, AppState, EVENT_EXPORT};
 use crate::updater;
+use crate::verify::{Verifier, VerifyOptions};
 use crate::{autotype, browser_bridge, prompts, quick, ssh_agent};
 
 type St<'a> = State<'a, AppState>;
@@ -197,6 +198,24 @@ async fn run_export(state: &AppState, password: &str) -> Result<export::Outcome,
 pub fn lock(state: St<'_>) -> CmdResult<()> {
     state.lock();
     Ok(())
+}
+
+// ---------------------------------------------------------------- verify again ("使用前需要验证")
+
+/// Whether Windows Hello can verify the user (items marked "使用前需要验证").
+#[tauri::command]
+pub async fn verify_user_options(state: St<'_>) -> CmdResult<VerifyOptions> {
+    let v = Verifier::new(&state)?;
+    blocking(move || v.options()).await
+}
+
+/// Verifies the user without changing the lock state: the master password,
+/// or Windows Hello when `password` is empty.
+#[tauri::command]
+pub async fn verify_user(state: St<'_>, password: Option<String>) -> CmdResult<()> {
+    let password = password.map(Zeroizing::new);
+    let v = Verifier::new(&state)?;
+    blocking(move || v.verify(password.as_deref().map(|p| p.as_str()))).await?
 }
 
 #[tauri::command]
@@ -930,6 +949,37 @@ fn item_content(state: &AppState, vault_id: &str, item_id: &str) -> CmdResult<It
         .ok_or_else(|| BridgeError::from(npw_core::CoreError::NotFound))
 }
 
+/// The item asks for verification and Quick Access has not verified it (`quick_verify`).
+fn quick_needs_verify(
+    state: &AppState,
+    c: &ItemContent,
+    vault_id: &str,
+    item_id: &str,
+) -> CmdResult<()> {
+    if c.reprompt && !state.quick_grant.take(vault_id, item_id) {
+        return Err(BridgeError::new("reprompt", "这个条目需要先验证身份"));
+    }
+    Ok(())
+}
+
+/// Quick Access: verifies the user for one item ("使用前需要验证"); the next
+/// auto-type or copy of a secret of that item may go ahead (once).
+#[tauri::command]
+pub async fn quick_verify(
+    state: St<'_>,
+    vault_id: String,
+    item_id: String,
+    password: Option<String>,
+) -> CmdResult<()> {
+    let password = password.map(Zeroizing::new);
+    // the item must exist
+    item_content(&state, &vault_id, &item_id)?;
+    let v = Verifier::new(&state)?;
+    blocking(move || v.verify(password.as_deref().map(|p| p.as_str()))).await??;
+    state.quick_grant.grant(&vault_id, &item_id);
+    Ok(())
+}
+
 /// Types the item's auto-type sequence into the window Quick Access was opened over.
 #[tauri::command]
 pub async fn quick_autotype(
@@ -951,6 +1001,7 @@ pub async fn quick_autotype(
             BridgeError::invalid("没有可以输入的目标窗口：请先切换到要登录的窗口，再按快捷键")
         })?;
     let content = item_content(&state, &vault_id, &item_id)?;
+    quick_needs_verify(&state, &content, &vault_id, &item_id)?;
     let steps =
         autotype::steps_for(&content, (now_ms() / 1000) as u64).map_err(BridgeError::invalid)?;
     drop(content);
@@ -983,6 +1034,9 @@ pub async fn quick_copy(
         ),
         _ => return Err(BridgeError::invalid("unknown field")),
     };
+    if secret {
+        quick_needs_verify(&state, &c, &vault_id, &item_id)?;
+    }
     let text = text.ok_or_else(|| BridgeError::invalid("这个条目没有这个字段"))?;
     state
         .clipboard
@@ -1012,6 +1066,25 @@ pub fn prompt_respond(
     decision: prompts::Decision,
 ) -> bool {
     state.prompts.respond(window.label(), decision)
+}
+
+/// A prompt for an item marked "使用前需要验证": verify the user before it
+/// can be approved (the master password, or Windows Hello when empty).
+#[tauri::command]
+pub async fn prompt_verify(
+    window: tauri::WebviewWindow,
+    state: St<'_>,
+    password: Option<String>,
+) -> CmdResult<()> {
+    let password = password.map(Zeroizing::new);
+    let id = window.label().to_string();
+    if state.prompts.info(&id).is_none() {
+        return Err(BridgeError::invalid("这个请求已经结束"));
+    }
+    let v = Verifier::new(&state)?;
+    blocking(move || v.verify(password.as_deref().map(|p| p.as_str()))).await??;
+    state.prompts.mark_verified(&id);
+    Ok(())
 }
 
 #[tauri::command]

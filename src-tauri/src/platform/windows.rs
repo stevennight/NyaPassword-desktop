@@ -12,6 +12,9 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows::core::{w, Array, HSTRING, PCWSTR, PWSTR};
+use windows::Security::Credentials::UI::{
+    UserConsentVerificationResult, UserConsentVerifier, UserConsentVerifierAvailability,
+};
 use windows::Security::Credentials::{
     KeyCredential, KeyCredentialCreationOption, KeyCredentialManager, KeyCredentialStatus,
 };
@@ -116,6 +119,29 @@ impl Platform for Windows {
             KeyCredentialManager::DeleteAsync(&HSTRING::from(name)).and_then(|op| op.join())
         {
             log::info!("deleting the Windows Hello key: {}", e.message());
+        }
+    }
+
+    fn user_consent_available(&self) -> bool {
+        UserConsentVerifier::CheckAvailabilityAsync()
+            .and_then(|op| op.join())
+            .is_ok_and(|a| a == UserConsentVerifierAvailability::Available)
+    }
+
+    fn user_consent_verify(&self, message: &str) -> Result<(), String> {
+        let _focus = PromptFocus::start();
+        let r = UserConsentVerifier::RequestVerificationAsync(&HSTRING::from(message))
+            .and_then(|op| op.join())
+            .map_err(|e| format!("Windows Hello：{}", e.message()))?;
+        match r {
+            UserConsentVerificationResult::Verified => Ok(()),
+            UserConsentVerificationResult::Canceled => Err("已取消 Windows Hello 验证".into()),
+            UserConsentVerificationResult::RetriesExhausted => {
+                Err("Windows Hello 尝试次数过多，请输入主密码".into())
+            }
+            _ => Err(
+                "Windows Hello 不可用（请在系统设置中设置 PIN 或生物识别），请输入主密码".into(),
+            ),
         }
     }
 

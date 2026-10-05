@@ -18,6 +18,7 @@ use crate::platform::{self, Platform, TargetWindow};
 use crate::prompts::Prompts;
 use crate::settings::Settings;
 use crate::ssh_agent::SshAgent;
+use crate::verify::ItemGrant;
 
 pub const REPLICA: &str = "replica.sqlite3";
 
@@ -48,6 +49,8 @@ pub struct AppState {
     pub quick_target: Mutex<Option<TargetWindow>>,
     /// Why the Quick Access shortcut could not be registered (empty = fine).
     pub quick_error: Mutex<String>,
+    /// Quick Access: the item the user just verified ("使用前需要验证").
+    pub quick_grant: ItemGrant,
 }
 
 impl AppState {
@@ -76,6 +79,7 @@ impl AppState {
             bridge: BrowserBridge::default(),
             quick_target: Mutex::new(None),
             quick_error: Mutex::new(String::new()),
+            quick_grant: ItemGrant::default(),
         }
     }
 
@@ -108,6 +112,7 @@ impl AppState {
         self.imports.lock().expect("imports").clear();
         self.ssh.on_lock();
         *self.quick_target.lock().expect("quick") = None;
+        self.quick_grant.clear();
         self.bridge.notify("locked");
     }
 

@@ -99,6 +99,18 @@ pub trait Platform: Send + Sync {
 
     fn quick_unlock_delete(&self, _name: &str) {}
 
+    /// The OS can confirm that the user is present (Windows Hello face /
+    /// fingerprint / PIN) without a key of ours. Used to verify again before
+    /// an item marked "使用前需要验证" is used, when quick unlock is off.
+    fn user_consent_available(&self) -> bool {
+        false
+    }
+
+    /// Asks the OS to verify the user (shows `message`). Blocks until answered.
+    fn user_consent_verify(&self, _message: &str) -> Result<(), String> {
+        Err("此平台暂不支持系统身份验证，请输入主密码".into())
+    }
+
     // ------------------------------------------------------------ clipboard
 
     /// Puts `text` on the clipboard; `secret` keeps it out of clipboard

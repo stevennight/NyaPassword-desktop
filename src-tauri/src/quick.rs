@@ -80,6 +80,7 @@ pub fn open(app: &AppHandle) {
     let st = app.state::<AppState>();
     let target = st.platform.foreground_window();
     *st.quick_target.lock().expect("quick") = target;
+    st.quick_grant.clear();
     let w = match app.get_webview_window(LABEL) {
         Some(w) => w,
         None => match build_window(app) {
@@ -106,6 +107,7 @@ pub fn reshow(app: &AppHandle) {
 }
 
 pub fn hide(app: &AppHandle) {
+    app.state::<AppState>().quick_grant.clear();
     if let Some(w) = app.get_webview_window(LABEL) {
         let _ = w.hide();
     }

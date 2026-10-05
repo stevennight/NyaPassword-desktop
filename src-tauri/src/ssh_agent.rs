@@ -8,7 +8,10 @@
 //!   us, 条目格式 §5). Nothing can be added over the protocol.
 //! - Every signature needs the user's confirmation in a small window
 //!   (allow once / allow until the vault locks / deny). Items with
-//!   `ssh.confirm_each_use = false` are confirmed once per unlock.
+//!   `ssh.confirm_each_use = false` are confirmed once per unlock. Items
+//!   marked "使用前需要验证" (`reprompt`) need the user verified (master
+//!   password / Windows Hello) in that window for every signature, and are
+//!   never remembered.
 //! - A request while the vault is locked shows the main window and waits up
 //!   to a minute for the user to unlock.
 //! - Git SSH signing works through the same path: `ssh-keygen -Y sign`
@@ -40,6 +43,8 @@ pub struct KeyEntry {
     pub blob: Vec<u8>,
     pub title: String,
     pub confirm_each_use: bool,
+    /// The item is marked "使用前需要验证": verify the user on every signature.
+    pub reprompt: bool,
     private_key: Zeroizing<String>,
     passphrase: Option<Zeroizing<String>>,
 }
@@ -98,6 +103,7 @@ pub fn keys_from_items(
                 c.title.clone()
             },
             confirm_each_use: c.ssh.as_ref().is_none_or(|s| s.confirm_each_use),
+            reprompt: c.reprompt,
             private_key: Zeroizing::new(private.to_string()),
             passphrase: passphrase.map(|p| Zeroizing::new(p.to_string())),
         });
@@ -145,13 +151,19 @@ impl KeySource for Snapshot {
 pub struct Grants(Mutex<HashSet<Vec<u8>>>);
 
 impl Grants {
-    /// Whether to sign: remembered, or asks (`ask`) and remembers as the answer says.
+    /// Whether to sign: remembered, or asks (`ask`) and remembers as the answer
+    /// says. A `reprompt` key always asks (the prompt verifies the user) and is
+    /// never remembered.
     pub fn check(
         &self,
         blob: &[u8],
         confirm_each_use: bool,
+        reprompt: bool,
         ask: impl FnOnce() -> Decision,
     ) -> bool {
+        if reprompt {
+            return ask() != Decision::Deny;
+        }
         if self.0.lock().expect("grants").contains(blob) {
             return true;
         }
@@ -370,11 +382,12 @@ impl Backend for AppBackend {
             purpose: describe(&req.purpose),
             process: peer.describe(),
             confirm_each_use: key.confirm_each_use,
+            reprompt: key.reprompt,
         };
         let ok = st
             .ssh
             .grants
-            .check(&req.key_blob, key.confirm_each_use, || {
+            .check(&req.key_blob, key.confirm_each_use, key.reprompt, || {
                 st.prompts.ask(&self.app, info, PROMPT_TIMEOUT)
             });
         log::info!(
@@ -511,10 +524,11 @@ mod tests {
         }
         fn approve(&self, req: &SignRequest, key: &KeyEntry, peer: &Peer) -> bool {
             self.peers.lock().unwrap().push(peer.clone());
-            self.grants.check(&req.key_blob, key.confirm_each_use, || {
-                self.asked.fetch_add(1, Ordering::SeqCst);
-                *self.answer.lock().unwrap()
-            })
+            self.grants
+                .check(&req.key_blob, key.confirm_each_use, key.reprompt, || {
+                    self.asked.fetch_add(1, Ordering::SeqCst);
+                    *self.answer.lock().unwrap()
+                })
         }
     }
 
@@ -694,6 +708,31 @@ mod tests {
             }
             server.abort();
         });
+    }
+
+    #[test]
+    fn reprompt_keys_are_asked_every_time() {
+        let (mut c, _) = item(KeyKind::Ed25519, "Protected", true);
+        c.reprompt = true;
+        c.ssh.as_mut().unwrap().confirm_each_use = false;
+        let keys = keys_from_items(&[("v".into(), "i".into(), c)], &|_, _, _, _, _| None);
+        assert!(keys[0].reprompt);
+        let g = Grants::default();
+        let blob = keys[0].blob.clone();
+        let asked = AtomicUsize::new(0);
+        let ask = |d: Decision| {
+            asked.fetch_add(1, Ordering::SeqCst);
+            d
+        };
+        // "until locked" and "once per unlock" are not remembered for such a key
+        assert!(g.check(&blob, false, true, || ask(Decision::Session)));
+        assert!(g.check(&blob, false, true, || ask(Decision::Once)));
+        assert!(!g.check(&blob, false, true, || ask(Decision::Deny)));
+        assert_eq!(asked.load(Ordering::SeqCst), 3);
+        // even a grant left over from before the item was marked is ignored
+        assert!(g.check(&blob, true, false, || ask(Decision::Session)));
+        assert!(!g.check(&blob, true, true, || ask(Decision::Deny)));
+        assert_eq!(asked.load(Ordering::SeqCst), 5);
     }
 
     #[test]
