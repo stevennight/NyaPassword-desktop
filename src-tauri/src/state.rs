@@ -10,11 +10,14 @@ use npw_core::{Client, ClientConfig};
 use npw_store_sqlite::SqliteStore;
 use tauri::{AppHandle, Emitter, Manager};
 
+use crate::browser_bridge::BrowserBridge;
 use crate::clipboard::Clipboard;
 use crate::device_key::{self, KeyStorage};
 use crate::error::{BridgeError, CmdResult};
-use crate::platform::{self, Platform};
+use crate::platform::{self, Platform, TargetWindow};
+use crate::prompts::Prompts;
 use crate::settings::Settings;
+use crate::ssh_agent::SshAgent;
 
 pub const REPLICA: &str = "replica.sqlite3";
 
@@ -23,6 +26,8 @@ pub const EVENT_LOCKED: &str = "npw:locked";
 pub const EVENT_SYNC: &str = "npw:sync";
 pub const EVENT_EXPORT: &str = "npw:export";
 pub const EVENT_UPDATE: &str = "npw:update";
+/// A message for the main window (shown as a toast).
+pub const EVENT_NOTICE: &str = "npw:notice";
 
 pub struct AppState {
     pub dir: PathBuf,
@@ -36,6 +41,13 @@ pub struct AppState {
     pub password_this_run: AtomicBool,
     pub exporting: AtomicBool,
     pub clipboard: Clipboard,
+    pub ssh: SshAgent,
+    pub prompts: Prompts,
+    pub bridge: BrowserBridge,
+    /// The window Quick Access types into (captured when it opens).
+    pub quick_target: Mutex<Option<TargetWindow>>,
+    /// Why the Quick Access shortcut could not be registered (empty = fine).
+    pub quick_error: Mutex<String>,
 }
 
 impl AppState {
@@ -59,6 +71,11 @@ impl AppState {
             password_this_run: AtomicBool::new(false),
             exporting: AtomicBool::new(false),
             clipboard: Clipboard::default(),
+            ssh: SshAgent::default(),
+            prompts: Prompts::default(),
+            bridge: BrowserBridge::default(),
+            quick_target: Mutex::new(None),
+            quick_error: Mutex::new(String::new()),
         }
     }
 
@@ -82,12 +99,21 @@ impl AppState {
         g.clone()
     }
 
-    /// Forgets keys, decrypted items and parsed imports.
+    /// Forgets keys, decrypted items, parsed imports and the ssh-agent's
+    /// "until locked" approvals; connected browser extensions lock too.
     pub fn lock(&self) {
         if let Ok(c) = &self.client {
             c.lock();
         }
         self.imports.lock().expect("imports").clear();
+        self.ssh.on_lock();
+        *self.quick_target.lock().expect("quick") = None;
+        self.bridge.notify("locked");
+    }
+
+    /// After any unlock: connected extensions may unlock now.
+    pub fn notify_unlocked(&self) {
+        self.bridge.notify("unlocked");
     }
 }
 

@@ -3,17 +3,21 @@
 //! Linux implementations build and run in CI but are untested on real
 //! machines ("experimental").
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use serde::Serialize;
 use tauri::AppHandle;
 use tauri_plugin_autostart::ManagerExt;
+
+use crate::autotype::Step;
 
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(windows)]
-mod windows;
+pub(crate) mod windows;
 
 /// Keyring service / user of the device key.
 const KEYRING_SERVICE: &str = "app.nya.password";
@@ -24,6 +28,31 @@ pub const MINIMIZED_ARG: &str = "--minimized";
 
 pub type LockCallback = Arc<dyn Fn() + Send + Sync>;
 
+/// The window that had the focus when Quick Access opened (auto-type goes back to it).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct TargetWindow {
+    /// Native handle (`HWND` on Windows); only meaningful to the platform layer.
+    #[serde(skip)]
+    pub handle: isize,
+    pub title: String,
+    /// File name of the process executable, e.g. `chrome.exe`.
+    pub process: String,
+}
+
+/// The OS's own ssh-agent, which may own the endpoint we want.
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct SystemAgent {
+    /// `""` (none / not applicable), `running`, `stopped`.
+    pub state: String,
+    /// `auto`, `manual`, `disabled` or `""`.
+    pub start_type: String,
+}
+
+/// Name of the native messaging host (`allowed_origins` live in its manifest).
+pub const NATIVE_HOST_NAME: &str = "app.nya.password";
+
+pub const UNSUPPORTED_AUTOTYPE: &str =
+    "此平台暂不支持自动输入（目前只支持 Windows），请使用复制用户名 / 密码";
 pub trait Platform: Send + Sync {
     // ------------------------------------------------------------ device key
 
@@ -99,6 +128,104 @@ pub trait Platform: Send + Sync {
             al.disable().map_err(|e| e.to_string())
         }
     }
+
+    // ------------------------------------------------------------ quick access / auto-type
+
+    /// The focused window of another program, captured before Quick Access shows.
+    fn foreground_window(&self) -> Option<TargetWindow> {
+        None
+    }
+
+    fn auto_type_supported(&self) -> bool {
+        false
+    }
+
+    /// Focuses `target` and types `steps` into it. Stops as soon as another
+    /// window takes the focus, so secrets never go to the wrong window.
+    fn auto_type(&self, _target: &TargetWindow, _steps: &[Step]) -> Result<(), String> {
+        Err(UNSUPPORTED_AUTOTYPE.into())
+    }
+
+    // ------------------------------------------------------------ ssh-agent
+
+    /// Where the agent listens unless the user picked something else:
+    /// a pipe name on Windows, a socket path elsewhere.
+    fn ssh_agent_default_endpoint(&self, data_dir: &Path) -> String {
+        data_dir.join("ssh-agent.sock").display().to_string()
+    }
+
+    /// The value for `SSH_AUTH_SOCK` / `IdentityAgent` for an endpoint.
+    fn ssh_auth_sock(&self, endpoint: &str) -> String {
+        endpoint.to_string()
+    }
+
+    fn system_ssh_agent(&self) -> SystemAgent {
+        SystemAgent::default()
+    }
+
+    /// The program serving an endpoint we could not take (e.g. `Bitwarden.exe`).
+    fn endpoint_owner(&self, _endpoint: &str) -> Option<String> {
+        None
+    }
+
+    // ------------------------------------------------------------ browser bridge
+
+    /// Installs the native messaging host manifest for Chrome, Edge and
+    /// Chromium; returns where it was registered.
+    fn register_native_host(&self, data_dir: &Path, manifest: &str) -> Result<Vec<String>, String> {
+        let _ = data_dir;
+        let mut done = Vec::new();
+        for dir in unix_native_host_dirs() {
+            // only browsers that exist for this user
+            if dir.parent().is_some_and(|p| p.exists()) {
+                std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+                let file = dir.join(format!("{NATIVE_HOST_NAME}.json"));
+                std::fs::write(&file, manifest).map_err(|e| format!("{}: {e}", file.display()))?;
+                done.push(file.display().to_string());
+            }
+        }
+        Ok(done)
+    }
+
+    fn unregister_native_host(&self, data_dir: &Path) {
+        let _ = data_dir;
+        for dir in unix_native_host_dirs() {
+            let _ = std::fs::remove_file(dir.join(format!("{NATIVE_HOST_NAME}.json")));
+        }
+    }
+
+    /// The executable the browser starts as the host.
+    fn native_host_exe(&self) -> Result<PathBuf, String> {
+        // an AppImage runs from a temporary mount; the browser must start the image itself
+        if let Some(p) = std::env::var_os("APPIMAGE") {
+            return Ok(PathBuf::from(p));
+        }
+        std::env::current_exe().map_err(|e| e.to_string())
+    }
+}
+
+/// `NativeMessagingHosts` folders of Chrome, Edge and Chromium (macOS, Linux).
+fn unix_native_host_dirs() -> Vec<PathBuf> {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return vec![];
+    };
+    let bases: &[&str] = if cfg!(target_os = "macos") {
+        &[
+            "Library/Application Support/Google/Chrome",
+            "Library/Application Support/Microsoft Edge",
+            "Library/Application Support/Chromium",
+        ]
+    } else {
+        &[
+            ".config/google-chrome",
+            ".config/microsoft-edge",
+            ".config/chromium",
+        ]
+    };
+    bases
+        .iter()
+        .map(|b| home.join(b).join("NativeMessagingHosts"))
+        .collect()
 }
 
 /// The implementation for the platform this build runs on.

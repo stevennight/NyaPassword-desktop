@@ -12,10 +12,88 @@ NyaPassword 的桌面客户端：Tauri 2 外壳 + 共享界面（`../common/web`
 - **托盘与后台**：关闭窗口只是隐藏到托盘；托盘菜单：显示 / 隐藏、锁定、立即同步、退出。单实例（再次启动只会把已有窗口调到前面）。可设置开机启动（直接最小化到托盘）。
 - **自动锁定**：空闲超时（界面设置）、系统锁屏 / 注销 / 切换用户 / 休眠时立即锁定（Windows：WTS 会话通知 + 电源广播）。锁定会清掉解密数据和尚未确认的导入。
 - **剪贴板**：复制的密码 90 秒后（若剪贴板里仍是它）以及退出应用时清除；Windows 上同时设置 `ExcludeClipboardContentFromMonitorProcessing`、`CanIncludeInClipboardHistory = 0`、`CanUploadToCloudClipboard = 0`，不进剪贴板历史、不上传云剪贴板。
+- **快捷搜索与自动输入**、**SSH agent**、**浏览器扩展联动**（见下，都在“设置”里开关）。
 - **定期离线导出**（见下）。
 - **自更新**（见下）。
 
-尚未实现（后续阶段）：全局快捷键快捷搜索 / 自动输入、SSH agent、浏览器扩展联动（Native Messaging）、Windows passkey 提供程序；macOS Touch ID、macOS / Linux 锁屏检测。
+尚未实现（后续阶段）：Windows passkey 提供程序；macOS Touch ID、macOS / Linux 锁屏检测；macOS / Linux 的自动输入。
+
+### 快捷搜索与自动输入
+
+在任意程序里按全局快捷键（默认 `Ctrl+Shift+Space`，“设置 → 快捷搜索与自动输入”可改，写法如 `Ctrl+Alt+K`；快捷键被其他程序占用时设置页会显示）弹出搜索框：
+
+- 打开前记下当前前台窗口（标题 + 进程名），先列出与它匹配的条目：条目网址的主机名 / 可注册域名出现在窗口标题里、条目标题出现在窗口标题里，或程序名（如 `WeChat.exe`）与条目标题相同。输入关键词则搜索全部条目（支持拼音 / 首字母）。
+- **Enter**：切回那个窗口，按条目的“自动输入序列”输入，默认 `{USERNAME}{TAB}{PASSWORD}{ENTER}`。序列在条目编辑页“自动输入”里设置（存为条目的 `autofill.auto_type`，见条目格式.md），可用 `{USERNAME}` `{PASSWORD}` `{TOTP}` `{URL}` `{TITLE}` `{S:字段名}`、按键 `{TAB}` `{ENTER}` `{SPACE}` `{BS}` `{DEL}` `{ESC}` `{UP}` `{DOWN}` `{LEFT}` `{RIGHT}` `{HOME}` `{END}`、`{DELAY 500}`，`{{}` / `{}}` 表示花括号，其他文字原样输入。
+- **Ctrl+U / Ctrl+P / Ctrl+T**：复制用户名 / 密码 / 验证码（秘密 90 秒后清除），Esc 关闭。
+- Windows 用 `SendInput` + `KEYEVENTF_UNICODE` 逐字输入，与键盘布局、输入法无关（中文、emoji 都可以）；输入前等 Ctrl / Shift / Alt 松开，**每个字符前都确认目标窗口仍在前台**，焦点变了立即停止。以管理员身份运行的程序会拦截普通程序的输入（UIPI），这时会提示。
+- macOS（CGEvent）/ Linux（X11 XTest）的自动输入**尚未实现**：快捷搜索可以用，只能复制，界面会说明。
+
+### SSH agent
+
+“设置 → SSH agent”开启后，桌面端用 OpenSSH agent 协议提供保险库中 **SSH 密钥**条目的私钥（解锁的所有保险库；条目编辑页可取消“提供给桌面端的 SSH agent”）。不能通过协议添加密钥。
+
+- **每次签名都弹出确认窗口**：密钥名、用途（SSH 登录的用户名和服务器主机密钥指纹 / Git 提交签名）、请求的程序（及其父进程，如 `ssh-keygen.exe（git.exe）`）。可选“允许一次”“锁定前都允许”“拒绝”；关窗口或 60 秒不处理 = 拒绝。条目关闭“每次签名都确认”时，每次解锁只确认一次。
+- 锁定时收到请求：弹出主窗口提示解锁，最多等 60 秒。
+- 签名算法：Ed25519、ECDSA（P-256 / P-384）、RSA（`rsa-sha2-256` / `rsa-sha2-512`；不做 SHA-1 的 `ssh-rsa`）。
+
+**Windows**：默认监听 `\\.\pipe\openssh-ssh-agent`，Windows 自带的 `ssh`、`ssh-add`、`ssh-keygen` 直接可用。这个管道可能已被占用：
+
+- Windows 的 **OpenSSH Authentication Agent** 服务（`ssh-agent`）：设置页会显示它的状态。可以停用它（管理员 PowerShell：`Stop-Service ssh-agent; Set-Service ssh-agent -StartupType Disabled`），或者
+- 其他密码管理器的 agent（例如 Bitwarden 桌面端）：设置页会显示占用的程序名。
+
+不想停用它们时，在设置里填其他管道名（如 `nyapassword-ssh-agent`），然后让客户端用它：
+
+```powershell
+[Environment]::SetEnvironmentVariable('SSH_AUTH_SOCK', '\\.\pipe\nyapassword-ssh-agent', 'User')   # 之后新开的终端生效
+```
+
+或在 `~/.ssh/config` 里：
+
+```
+Host *
+    IdentityAgent //./pipe/nyapassword-ssh-agent
+```
+
+管道的访问控制只允许当前用户，拒绝远程客户端。
+
+**Git 提交签名**（SSHSIG）：
+
+```powershell
+git config --global gpg.format ssh
+git config --global user.signingkey "C:/Users/<你>/.ssh/id_ed25519.pub"     # 保险库里那把密钥的公钥（文件里只需公钥）
+git config --global gpg.ssh.program "C:/Windows/System32/OpenSSH/ssh-keygen.exe"
+git config --global commit.gpgsign true
+# 验证：gpg.ssh.allowedSignersFile 指向“邮箱 namespaces="git" 公钥”格式的文件，然后 git log --show-signature
+```
+
+Git for Windows 自带的 `ssh` / `ssh-keygen`（MSYS 版）不认识 Windows 命名管道，所以 `gpg.ssh.program` 和 `core.sshCommand`（`C:/Windows/System32/OpenSSH/ssh.exe`）都要指向 Windows 的 OpenSSH。
+
+**WSL**：WSL 里的 ssh 用 Unix socket，需要一个桥接到 Windows 命名管道的转发程序，常用 [npiperelay](https://github.com/jstarks/npiperelay)（Windows 侧）+ `socat`（WSL 侧）：
+
+```bash
+# WSL 里（先 sudo apt install socat，并把 npiperelay.exe 放到 Windows 的 PATH 中）
+export SSH_AUTH_SOCK=$HOME/.ssh/agent.sock
+if ! ss -a | grep -q "$SSH_AUTH_SOCK"; then
+  rm -f "$SSH_AUTH_SOCK"
+  (setsid socat UNIX-LISTEN:"$SSH_AUTH_SOCK",fork EXEC:"npiperelay.exe -ei -s //./pipe/openssh-ssh-agent",nofork &) >/dev/null 2>&1
+fi
+```
+
+写进 `~/.bashrc`；用了其他管道名就把 `openssh-ssh-agent` 换掉。也可以用 [wsl-ssh-agent](https://github.com/rupor-github/wsl-ssh-agent) 等同类工具。确认窗口里的程序会显示为 `npiperelay.exe`。
+
+**macOS / Linux（实验性）**：监听 `<应用数据目录>/ssh-agent.sock`（权限 0600；macOS 为 `~/Library/Application Support/app.nya.password/ssh-agent.sock`，Linux 为 `~/.local/share/app.nya.password/ssh-agent.sock`），可在设置里改路径。设置 `export SSH_AUTH_SOCK="<路径>"` 或 `IdentityAgent`。Linux 上确认窗口能显示请求的程序，macOS 上不能。
+
+### 浏览器扩展联动（Native Messaging）
+
+配对后：桌面端已解锁时，扩展打开弹窗 / 内联菜单即可解锁，不用再输主密码；桌面端锁定时，已连接的扩展跟着锁定；桌面端解锁时，已连接的扩展也会解锁。
+
+1. 扩展弹窗 ⚙ → 打开“由桌面端解锁”（浏览器会请求 `nativeMessaging` 权限），复制显示的**扩展 ID**。
+2. 桌面端“设置 → 浏览器扩展联动”：填入扩展 ID（每行一个，Chrome 和 Edge 的 ID 不同时都填），开启。桌面端注册 Native Messaging 宿主：清单写到 `<应用数据目录>\native-messaging\app.nya.password.json`（`allowed_origins` = 这些扩展），注册表 `HKCU\Software\Google\Chrome\NativeMessagingHosts\app.nya.password`、`HKCU\Software\Microsoft\Edge\...`、`HKCU\Software\Chromium\...` 指向它；macOS / Linux（实验性）写到各浏览器的 `NativeMessagingHosts` 目录。关闭时删除注册；卸载程序也会删除（NSIS 钩子 `src-tauri/windows/hooks.nsh`）；应用每次启动会重新注册，保证指向当前程序。
+3. 扩展弹窗 ⚙ → “与桌面端配对”：扩展和桌面端弹窗显示**同一个 6 位数字**，在桌面端点“允许配对”。扩展和桌面端必须登录同一个账户（同一服务器）。
+
+扩展 ID：商店发布的 ID 固定；“加载已解压的扩展程序”时 ID 由所在路径决定（manifest 里没有 `key`），换目录加载后要重新填写和配对。
+
+原理：宿主就是桌面端程序本身——浏览器以 `nyapassword-desktop.exe chrome-extension://<ID>/` 启动它，它不开窗口，只把消息转发到正在运行的应用（只对当前用户开放的本地管道 `\\.\pipe\app.nya.password.browser-bridge.<用户 SID>`；macOS / Linux 为应用数据目录下的 `browser-bridge.sock`）。应用没运行时扩展会提示。扩展保存一对 P-256 密钥（私钥是不可导出的 WebCrypto 密钥），桌面端只保存公钥；解锁时桌面端把账户密钥用一次性的 ECDH + HKDF-SHA256 + AES-256-GCM 封装给扩展（绑定账户 ID 和扩展给的随机数），扩展解开后调用 `unlockWithKey`，核心会校验这把密钥。安全分析见 [威胁模型.md](../common/docs/威胁模型.md) §3.9.1。取消配对：桌面端设置里的配对列表，或扩展弹窗 ⚙。
 
 ### 定期离线导出
 
@@ -47,7 +125,14 @@ desktop/
 │     ├─ export.rs       定期离线导出与清理
 │     ├─ updater.rs      自更新（minisign + SHA-256）
 │     ├─ device_key.rs   设备密钥
-│     └─ platform/       Windows / macOS / Linux 实现（凭据存储、快速解锁、剪贴板、锁屏、开机启动）
+│     ├─ ssh_agent.rs    SSH agent（npw-ssh 协议 + 确认 + 锁定时等待解锁）
+│     ├─ quick.rs        快捷搜索窗口与全局快捷键
+│     ├─ autotype.rs     自动输入序列、窗口匹配
+│     ├─ browser_bridge.rs 浏览器扩展联动：协议、配对、封装、宿主模式
+│     ├─ prompts.rs      确认窗口（SSH 签名、扩展配对）
+│     ├─ ipc.rs          只对当前用户开放的命名管道 / Unix socket
+│     └─ platform/       Windows / macOS / Linux 实现（凭据存储、快速解锁、剪贴板、锁屏、开机启动、前台窗口与自动输入、OpenSSH 服务状态、宿主注册）
+│  └─ windows/hooks.nsh  NSIS 卸载钩子（删除 Native Messaging 注册）
 ├─ tools/update-sign/    生成更新签名密钥、签名 SHA256SUMS（minisign 格式）
 └─ scripts/              release.ps1、new-update-key.ps1
 ```
@@ -65,6 +150,10 @@ cargo test --workspace       # 单元测试：快速解锁包装、导出清理�
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check            # 不要加 --all：那会连 ../common 的 path 依赖一起格式化
 ```
+
+界面里桌面端专用的小窗口（快捷搜索、确认窗口）是 `../common/web/desktop.html`（只在 `--mode desktop` 构建）。
+
+只在调试版（`debug_assertions`）里有效的测试开关，发布版不包含：`NPW_TEST_AUTO_APPROVE=1`（确认窗口一律“允许一次”，用于用真实 OpenSSH 工具自动测试 agent）、`NPW_TEST_WEBVIEW_ARGS=--remote-debugging-port=<端口>`（给所有 WebView2 窗口加参数，测试可经 CDP 操作窗口）。`cargo test -- --ignored native_host` 会真实写入并删除 HKCU 的宿主注册。
 
 本地测试服务端：在 `../server` 里 `cargo run -- --data .\data`（监听 `127.0.0.1:8087`），桌面端登录界面的服务器填 `http://127.0.0.1:8087`（http 只允许 localhost）。
 

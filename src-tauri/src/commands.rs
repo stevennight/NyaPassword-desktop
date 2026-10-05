@@ -20,9 +20,10 @@ use zeroize::Zeroizing;
 use crate::error::{BridgeError, CmdResult};
 use crate::export;
 use crate::quick_unlock;
-use crate::settings::ExportSettings;
+use crate::settings::{ExportSettings, Pairing};
 use crate::state::{now_ms, AppState, EVENT_EXPORT};
 use crate::updater;
+use crate::{autotype, browser_bridge, prompts, quick, ssh_agent};
 
 type St<'a> = State<'a, AppState>;
 
@@ -95,6 +96,7 @@ pub async fn register(
         )
         .await?;
     state.mark_password_unlock();
+    state.notify_unlocked();
     Ok(kit)
 }
 
@@ -130,6 +132,7 @@ pub async fn unlock(app: AppHandle, state: St<'_>, password: String) -> CmdResul
 /// lives only as long as that export; it is never written anywhere.
 fn after_password_unlock(app: &AppHandle, state: &AppState, password: Zeroizing<String>) {
     let s = state.mark_password_unlock();
+    state.notify_unlocked();
     if !export::is_due(&s.export, now_ms()) || state.exporting.swap(true, Ordering::SeqCst) {
         return;
     }
@@ -317,6 +320,7 @@ pub async fn quick_unlock(state: St<'_>) -> CmdResult<()> {
         }
         return Err(e.into());
     }
+    state.notify_unlocked();
     Ok(())
 }
 
@@ -707,6 +711,33 @@ pub struct DesktopSettingsView {
     exporting: bool,
     autostart: bool,
     check_updates: bool,
+    ssh_agent: SshAgentView,
+    quick_access: QuickAccessView,
+    browser_bridge: BrowserBridgeView,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SshAgentView {
+    /// The configured endpoint (empty = default).
+    endpoint_setting: String,
+    #[serde(flatten)]
+    status: ssh_agent::AgentStatus,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct QuickAccessView {
+    enabled: bool,
+    shortcut: String,
+    error: String,
+    auto_type_supported: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BrowserBridgeView {
+    extension_ids: Vec<String>,
+    pairings: Vec<Pairing>,
+    #[serde(flatten)]
+    status: browser_bridge::BridgeStatus,
 }
 
 fn settings_view(app: &AppHandle, state: &AppState) -> DesktopSettingsView {
@@ -716,6 +747,21 @@ fn settings_view(app: &AppHandle, state: &AppState) -> DesktopSettingsView {
         exporting: state.exporting.load(Ordering::SeqCst),
         autostart: state.platform.autostart_enabled(app),
         check_updates: s.check_updates,
+        ssh_agent: SshAgentView {
+            endpoint_setting: s.ssh_agent.endpoint,
+            status: state.ssh.status(),
+        },
+        quick_access: QuickAccessView {
+            enabled: s.quick_access.enabled,
+            shortcut: s.quick_access.shortcut,
+            error: state.quick_error.lock().expect("quick").clone(),
+            auto_type_supported: state.platform.auto_type_supported(),
+        },
+        browser_bridge: BrowserBridgeView {
+            extension_ids: s.browser_bridge.extension_ids,
+            pairings: s.browser_bridge.pairings,
+            status: state.bridge.status(),
+        },
     }
 }
 
@@ -754,6 +800,218 @@ pub fn set_desktop_settings(
         s.check_updates = check_updates;
     });
     Ok(settings_view(&app, &state))
+}
+
+/// Pipe name (Windows; a `\\.\pipe\` prefix is accepted) or socket path.
+fn clean_endpoint(endpoint: &str) -> CmdResult<String> {
+    let e = endpoint.trim();
+    if cfg!(windows) {
+        let name = e
+            .strip_prefix(r"\\.\pipe\")
+            .or_else(|| e.strip_prefix("//./pipe/"))
+            .unwrap_or(e);
+        if name.len() > 200
+            || name
+                .chars()
+                .any(|c| c == '\\' || c == '/' || c.is_control())
+        {
+            return Err(BridgeError::invalid("管道名不能包含 \\ 或 /"));
+        }
+        Ok(name.to_string())
+    } else {
+        if !e.is_empty() && !e.starts_with('/') {
+            return Err(BridgeError::invalid("请填写 socket 的绝对路径"));
+        }
+        Ok(e.to_string())
+    }
+}
+
+#[tauri::command]
+pub async fn set_ssh_agent(
+    app: AppHandle,
+    state: St<'_>,
+    enabled: bool,
+    endpoint: String,
+) -> CmdResult<DesktopSettingsView> {
+    let endpoint = clean_endpoint(&endpoint)?;
+    state.update_settings(|s| {
+        s.ssh_agent.enabled = enabled;
+        s.ssh_agent.endpoint = endpoint;
+    });
+    ssh_agent::apply(&app).await;
+    Ok(settings_view(&app, &state))
+}
+
+#[tauri::command]
+pub fn set_quick_access(
+    app: AppHandle,
+    state: St<'_>,
+    enabled: bool,
+    shortcut: String,
+) -> CmdResult<DesktopSettingsView> {
+    let shortcut = shortcut.trim().to_string();
+    if enabled {
+        quick::parse_shortcut(&shortcut).map_err(BridgeError::invalid)?;
+    }
+    state.update_settings(|s| {
+        s.quick_access.enabled = enabled;
+        if !shortcut.is_empty() {
+            s.quick_access.shortcut = shortcut;
+        }
+    });
+    // a failure is reported in the view (`quick_access.error`)
+    let _ = quick::apply_shortcut(&app);
+    Ok(settings_view(&app, &state))
+}
+
+#[tauri::command]
+pub async fn set_browser_bridge(
+    app: AppHandle,
+    state: St<'_>,
+    enabled: bool,
+    extension_ids: Vec<String>,
+) -> CmdResult<DesktopSettingsView> {
+    let mut ids: Vec<String> = extension_ids
+        .iter()
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    ids.dedup();
+    if let Some(bad) = ids.iter().find(|i| !browser_bridge::valid_extension_id(i)) {
+        return Err(BridgeError::invalid(format!(
+            "“{bad}” 不是扩展 ID（32 个 a–p 的小写字母，见扩展弹窗 ⚙）"
+        )));
+    }
+    if enabled && ids.is_empty() {
+        return Err(BridgeError::invalid("请先填写浏览器扩展的 ID"));
+    }
+    state.update_settings(|s| {
+        s.browser_bridge.enabled = enabled;
+        s.browser_bridge.extension_ids = ids;
+    });
+    browser_bridge::apply(&app, true).await;
+    Ok(settings_view(&app, &state))
+}
+
+#[tauri::command]
+pub fn remove_pairing(app: AppHandle, state: St<'_>, id: String) -> DesktopSettingsView {
+    state.update_settings(|s| s.browser_bridge.pairings.retain(|p| p.id != id));
+    settings_view(&app, &state)
+}
+
+// ---------------------------------------------------------------- quick access window
+
+#[tauri::command]
+pub fn quick_context(state: St<'_>) -> quick::QuickContext {
+    quick::context(&state)
+}
+
+#[tauri::command]
+pub fn quick_search(state: St<'_>, query: String) -> Vec<npw_core::ItemView> {
+    quick::search(&state, &query)
+}
+
+#[tauri::command]
+pub fn quick_hide(app: AppHandle) {
+    quick::hide(&app);
+}
+
+#[tauri::command]
+pub fn quick_show_main(app: AppHandle) {
+    quick::hide(&app);
+    crate::state::show_main(&app);
+}
+
+fn item_content(state: &AppState, vault_id: &str, item_id: &str) -> CmdResult<ItemContent> {
+    state
+        .client()?
+        .item(vault_id, item_id)?
+        .content
+        .ok_or_else(|| BridgeError::from(npw_core::CoreError::NotFound))
+}
+
+/// Types the item's auto-type sequence into the window Quick Access was opened over.
+#[tauri::command]
+pub async fn quick_autotype(
+    app: AppHandle,
+    state: St<'_>,
+    vault_id: String,
+    item_id: String,
+) -> CmdResult<()> {
+    let platform = state.platform;
+    if !platform.auto_type_supported() {
+        return Err(BridgeError::invalid(crate::platform::UNSUPPORTED_AUTOTYPE));
+    }
+    let target = state
+        .quick_target
+        .lock()
+        .expect("quick")
+        .clone()
+        .ok_or_else(|| {
+            BridgeError::invalid("没有可以输入的目标窗口：请先切换到要登录的窗口，再按快捷键")
+        })?;
+    let content = item_content(&state, &vault_id, &item_id)?;
+    let steps =
+        autotype::steps_for(&content, (now_ms() / 1000) as u64).map_err(BridgeError::invalid)?;
+    drop(content);
+    quick::hide(&app);
+    let r = blocking(move || platform.auto_type(&target, &steps)).await?;
+    if r.is_err() {
+        // tell the user in Quick Access why nothing (or not everything) was typed
+        quick::reshow(&app);
+    }
+    r.map_err(BridgeError::invalid)
+}
+
+#[tauri::command]
+pub async fn quick_copy(
+    state: St<'_>,
+    vault_id: String,
+    item_id: String,
+    what: String,
+) -> CmdResult<()> {
+    let c = item_content(&state, &vault_id, &item_id)?;
+    let field = |p: &str| c.by_purpose(p).map(|f| f.text()).filter(|s| !s.is_empty());
+    let (text, secret) = match what.as_str() {
+        "username" => (field("username").or_else(|| field("email")), false),
+        "password" => (field("password"), true),
+        "totp" => (
+            c.totp()
+                .and_then(|u| npw_otp::OtpSpec::parse(&u).ok())
+                .map(|s| s.code((now_ms() / 1000) as u64)),
+            true,
+        ),
+        _ => return Err(BridgeError::invalid("unknown field")),
+    };
+    let text = text.ok_or_else(|| BridgeError::invalid("这个条目没有这个字段"))?;
+    state
+        .clipboard
+        .copy(state.platform, text, secret)
+        .map_err(BridgeError::invalid)
+}
+
+/// Checks an auto-type sequence typed in the item editor.
+#[tauri::command]
+pub fn check_auto_type(sequence: String) -> CmdResult<()> {
+    autotype::validate(&sequence).map_err(BridgeError::invalid)
+}
+
+// ---------------------------------------------------------------- confirmation windows
+
+/// The prompt shown in the calling window (its label is the prompt's id, so
+/// a window can only see and answer its own prompt).
+#[tauri::command]
+pub fn prompt_info(window: tauri::WebviewWindow, state: St<'_>) -> Option<prompts::PromptInfo> {
+    state.prompts.info(window.label())
+}
+
+#[tauri::command]
+pub fn prompt_respond(
+    window: tauri::WebviewWindow,
+    state: St<'_>,
+    decision: prompts::Decision,
+) -> bool {
+    state.prompts.respond(window.label(), decision)
 }
 
 #[tauri::command]
@@ -831,6 +1089,19 @@ mod tests {
         );
         assert_eq!(percent_decode("abc").unwrap(), "abc");
         assert!(percent_decode("%zz").is_err());
+    }
+
+    #[test]
+    fn endpoints() {
+        if cfg!(windows) {
+            assert_eq!(clean_endpoint(r"\\.\pipe\npw-agent").unwrap(), "npw-agent");
+            assert_eq!(clean_endpoint(" npw-agent ").unwrap(), "npw-agent");
+            assert_eq!(clean_endpoint("").unwrap(), "");
+            assert!(clean_endpoint(r"..\evil").is_err());
+        } else {
+            assert_eq!(clean_endpoint("/tmp/a.sock").unwrap(), "/tmp/a.sock");
+            assert!(clean_endpoint("relative.sock").is_err());
+        }
     }
 
     #[test]
