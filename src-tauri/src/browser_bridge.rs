@@ -966,7 +966,8 @@ mod tests {
                 if cfg!(windows) {
                     n
                 } else {
-                    std::env::temp_dir().join(n).display().to_string()
+                    // /tmp, not $TMPDIR: macOS temp paths are too long for a socket (SUN_LEN)
+                    std::path::Path::new("/tmp").join(n).display().to_string()
                 }
             };
             let listener = Listener::bind(&name).unwrap();

@@ -302,7 +302,8 @@ mod tests {
         if cfg!(windows) {
             n
         } else {
-            std::env::temp_dir().join(n).display().to_string()
+            // /tmp, not $TMPDIR: macOS temp paths are too long for a socket (SUN_LEN)
+            std::path::Path::new("/tmp").join(n).display().to_string()
         }
     }
 
@@ -315,13 +316,19 @@ mod tests {
             // the name is taken now: a second exclusive bind must fail
             assert!(Listener::bind(&name).is_err());
             let server = tokio::spawn(async move {
-                let (mut c, peer) = l.accept().await.unwrap();
-                let m = read_frame(&mut c, 1024).await.unwrap().unwrap();
-                write_frame(&mut c, &[m.as_slice(), b"!"].concat())
-                    .await
-                    .unwrap();
-                assert!(read_frame(&mut c, 1024).await.unwrap().is_none());
-                peer
+                loop {
+                    let (mut c, peer) = l.accept().await.unwrap();
+                    // on Unix the liveness probe of the second bind above is a
+                    // connection that closes at once: skip it like a real server
+                    let Some(m) = read_frame(&mut c, 1024).await.unwrap() else {
+                        continue;
+                    };
+                    write_frame(&mut c, &[m.as_slice(), b"!"].concat())
+                        .await
+                        .unwrap();
+                    assert!(read_frame(&mut c, 1024).await.unwrap().is_none());
+                    break peer;
+                }
             });
             let mut c = connect(&name).await.unwrap();
             write_frame(&mut c, b"hello").await.unwrap();
