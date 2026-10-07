@@ -15,6 +15,7 @@ NyaPassword 的桌面客户端：Tauri 2 外壳 + 共享界面（`../common/web`
 - **自动锁定**：空闲超时（界面设置）、系统锁屏 / 注销 / 切换用户 / 休眠时立即锁定（Windows：WTS 会话通知 + 电源广播）。锁定会清掉解密数据和尚未确认的导入。
 - **剪贴板**：复制的密码 90 秒后（若剪贴板里仍是它）以及退出应用时清除；Windows 上同时设置 `ExcludeClipboardContentFromMonitorProcessing`、`CanIncludeInClipboardHistory = 0`、`CanUploadToCloudClipboard = 0`，不进剪贴板历史、不上传云剪贴板。
 - **使用前需要验证**：条目设置了“使用前需要验证”（编辑页勾选；从 Bitwarden 导入的“主密码重新提示”自动转换）时，密码库在验证前只显示标题、用户名和网址；查看、复制、编辑前输入主密码、PIN 或使用 Windows Hello。开启了 Windows Hello 快速解锁时用同一个 Hello 密钥签名并核对账户密钥，否则只做 Windows Hello 在场确认；PIN 由核心核对，输错同样计入 5 次；PIN 和 Hello 受 14 天规则约束，主密码总是可用。验证只对当前打开的条目有效，换条目或锁定后失效。快捷搜索、SSH agent 见下。说明见 [威胁模型.md](../common/docs/威胁模型.md) §3.8.1。
+- **右键菜单与链接**：条目列表和字段右键是应用自己的菜单（复制、打开网站、编辑、收藏、归档、删除等），不显示 WebView 的网页菜单（输入框和选中文字保留剪切 / 复制 / 粘贴）。链接用系统默认浏览器打开（只允许 http / https）。
 - **快捷搜索与自动输入**、**SSH agent**、**浏览器扩展联动**（见下，都在“设置”里开关）。
 - **定期离线导出**（见下）。
 - **自更新**（见下）。

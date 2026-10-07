@@ -164,6 +164,7 @@ pub fn run() {
             commands::update_check,
             commands::update_install,
             commands::open_release_page,
+            commands::open_url,
             commands::set_ssh_agent,
             commands::set_quick_access,
             commands::set_browser_bridge,

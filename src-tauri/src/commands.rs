@@ -1264,9 +1264,42 @@ pub fn open_release_page(app: AppHandle, url: String) -> CmdResult<()> {
         .map_err(BridgeError::invalid)
 }
 
+/// A link in the vault (an item's website, a link field): the window cannot
+/// open one itself, it goes to the default browser. Only http(s) addresses.
+#[tauri::command]
+pub fn open_url(app: AppHandle, url: String) -> CmdResult<()> {
+    use tauri_plugin_opener::OpenerExt;
+    let url = web_url(&url).ok_or_else(|| BridgeError::invalid("not a web address"))?;
+    app.opener()
+        .open_url(url, None::<&str>)
+        .map_err(BridgeError::invalid)
+}
+
+fn web_url(url: &str) -> Option<String> {
+    let u = tauri::Url::parse(url.trim()).ok()?;
+    (matches!(u.scheme(), "http" | "https") && u.host_str().is_some()).then(|| u.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web_urls() {
+        assert_eq!(
+            web_url("https://example.com").as_deref(),
+            Some("https://example.com/")
+        );
+        assert_eq!(
+            web_url(" http://example.com/a?b=1 ").as_deref(),
+            Some("http://example.com/a?b=1")
+        );
+        assert!(web_url("file:///C:/Windows/System32/calc.exe").is_none());
+        assert!(web_url("ms-settings:").is_none());
+        assert!(web_url("javascript:alert(1)").is_none());
+        assert!(web_url("example.com").is_none());
+        assert!(web_url("").is_none());
+    }
 
     #[test]
     fn header_decoding() {
