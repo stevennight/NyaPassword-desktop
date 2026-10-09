@@ -289,6 +289,24 @@ pub fn extension_id(origin: &str) -> Option<String> {
     valid_extension_id(id).then(|| id.to_string())
 }
 
+/// The published extension: Chrome Web Store and Edge Add-ons. Always
+/// allowed; settings only add other IDs (an unpacked or self-built extension).
+pub const STORE_EXTENSION_IDS: &[&str] = &[
+    "eiggbhfjinenmhokcjadonmbaecjiinl", // Chrome Web Store
+    "iboelkeoigjhfkfnoknclhachocjflnl", // Edge Add-ons
+];
+
+/// The store extensions followed by the IDs from settings, without duplicates.
+pub fn allowed_extension_ids(extra: &[String]) -> Vec<String> {
+    let mut ids: Vec<String> = STORE_EXTENSION_IDS.iter().map(|s| s.to_string()).collect();
+    for id in extra {
+        if !ids.contains(id) {
+            ids.push(id.clone());
+        }
+    }
+    ids
+}
+
 /// Chrome extension IDs: 32 letters a–p.
 pub fn valid_extension_id(id: &str) -> bool {
     id.len() == 32 && id.bytes().all(|b| (b'a'..=b'p').contains(&b))
@@ -636,7 +654,10 @@ impl Host for AppHost {
     fn allowed_extension(&self, extension_id: &str) -> bool {
         let st = self.app.state::<AppState>();
         let s = st.settings().browser_bridge;
-        s.enabled && s.extension_ids.iter().any(|i| i == extension_id)
+        s.enabled
+            && allowed_extension_ids(&s.extension_ids)
+                .iter()
+                .any(|i| i == extension_id)
     }
 
     fn pairings(&self) -> Vec<Pairing> {
@@ -730,12 +751,11 @@ pub async fn apply(app: &AppHandle, unregister: bool) -> BridgeStatus {
         if unregister {
             st.platform.unregister_native_host(&st.dir);
         }
-    } else if s.extension_ids.is_empty() {
-        status.error = "请先填写浏览器扩展的 ID".into();
     } else {
+        let ids = allowed_extension_ids(&s.extension_ids);
         let registered = st.platform.native_host_exe().and_then(|exe| {
             st.platform
-                .register_native_host(&st.dir, &manifest(&exe, &s.extension_ids))
+                .register_native_host(&st.dir, &manifest(&exe, &ids))
         });
         match registered {
             Ok(r) => status.registered = r,
@@ -1361,6 +1381,11 @@ mod tests {
         assert_eq!(extension_id("chrome-extension://short/"), None);
         assert_eq!(extension_id("https://example.com/"), None);
         assert!(!valid_extension_id("ABCDEFGHIJKLMNOPABCDEFGHIJKLMNOP"));
+        assert!(STORE_EXTENSION_IDS.iter().all(|i| valid_extension_id(i)));
+        let ids = allowed_extension_ids(&[EXT.into(), STORE_EXTENSION_IDS[1].into()]);
+        assert_eq!(ids.len(), STORE_EXTENSION_IDS.len() + 1);
+        assert_eq!(ids[..STORE_EXTENSION_IDS.len()], *STORE_EXTENSION_IDS);
+        assert_eq!(ids.last().map(String::as_str), Some(EXT));
     }
 
     /// The host process relays both ways through a real pipe to a server that

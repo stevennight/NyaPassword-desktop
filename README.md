@@ -98,13 +98,13 @@ fi
 - 桌面端没有运行时，上面的明确操作会让 Native Messaging 宿主以普通方式启动桌面端（单实例），再转发这次请求；其他请求只回答“桌面端没有运行”。
 - 桌面端锁定时，已连接的扩展跟着锁定；桌面端解锁时，已连接的扩展也会解锁。
 
-1. 扩展弹窗 ⚙ → 打开“由桌面端解锁”（浏览器会请求 `nativeMessaging` 权限），复制显示的**扩展 ID**。
-2. 桌面端“设置 → 浏览器扩展联动”：填入扩展 ID（每行一个，Chrome 和 Edge 的 ID 不同时都填），开启。桌面端注册 Native Messaging 宿主：清单写到 `<应用数据目录>\native-messaging\app.nya.password.json`（`allowed_origins` = 这些扩展），注册表 `HKCU\Software\Google\Chrome\NativeMessagingHosts\app.nya.password`、`HKCU\Software\Microsoft\Edge\...`、`HKCU\Software\Chromium\...` 指向它；macOS / Linux（实验性）写到各浏览器的 `NativeMessagingHosts` 目录。关闭时删除注册；卸载程序也会删除（NSIS 钩子 `src-tauri/windows/hooks.nsh`）；应用每次启动会重新注册，保证指向当前程序。
+1. 扩展弹窗 ⚙ → 打开“由桌面端解锁”（浏览器会请求 `nativeMessaging` 权限）。
+2. 桌面端“设置 → 浏览器扩展联动”：开启。Chrome 应用商店和 Edge 加载项里的扩展 ID 已内置（`browser_bridge::STORE_EXTENSION_IDS`），不用填写；自行打包或加载未打包的扩展时，再把扩展弹窗 ⚙ 里显示的扩展 ID 填到“其他扩展 ID”（每行一个）。桌面端注册 Native Messaging 宿主：清单写到 `<应用数据目录>\native-messaging\app.nya.password.json`（`allowed_origins` = 这些扩展），注册表 `HKCU\Software\Google\Chrome\NativeMessagingHosts\app.nya.password`、`HKCU\Software\Microsoft\Edge\...`、`HKCU\Software\Chromium\...` 指向它；macOS / Linux（实验性）写到各浏览器的 `NativeMessagingHosts` 目录。关闭时删除注册；卸载程序也会删除（NSIS 钩子 `src-tauri/windows/hooks.nsh`）；应用每次启动会重新注册，保证指向当前程序。
 3. 扩展弹窗 ⚙ → “与桌面端配对”：扩展和桌面端弹窗显示**同一个 6 位数字**，在桌面端点“允许配对”。扩展和桌面端必须登录同一个账户（同一服务器）。
 
 
 注意：**不要从打包应用（MSIX / 应用商店应用，例如 Claude 桌面版的终端）里启动桌面端来测试联动。** Windows 会把这类进程对 `HKCU` 注册表和 `AppData` 的写入重定向到那个应用包的私有副本（`%LOCALAPPDATA%\Packages\<包名>\LocalCache`），浏览器看不到这里的注册，配对会报“找不到 NyaPassword 桌面端”（Edge / Chrome 日志：`Can't find manifest for native messaging host app.nya.password`）。用安装包安装后从开始菜单启动即可。
-扩展 ID：商店发布的 ID 固定；“加载已解压的扩展程序”时 ID 由所在路径决定（manifest 里没有 `key`），换目录加载后要重新填写和配对。
+扩展 ID：商店发布的 ID 固定（已内置）；“加载已解压的扩展程序”时 ID 由所在路径决定（manifest 里没有 `key`），换目录加载后要重新填写和配对。
 
 原理：宿主就是桌面端程序本身——浏览器以 `nyapassword-desktop.exe chrome-extension://<ID>/` 启动它，它不开窗口，只把消息转发到正在运行的应用（只对当前用户开放的本地管道 `\\.\pipe\app.nya.password.browser-bridge.<用户 SID>`；macOS / Linux 为应用数据目录下的 `browser-bridge.sock`）。应用没运行时扩展会提示。扩展保存一对 P-256 密钥（私钥是不可导出的 WebCrypto 密钥），桌面端只保存公钥；解锁时桌面端把账户密钥用一次性的 ECDH + HKDF-SHA256 + AES-256-GCM 封装给扩展（绑定账户 ID 和扩展给的随机数），扩展解开后调用 `unlockWithKey`，核心会校验这把密钥。安全分析见 [威胁模型.md](../common/docs/威胁模型.md) §3.9.1。取消配对：桌面端设置里的配对列表，或扩展弹窗 ⚙。
 

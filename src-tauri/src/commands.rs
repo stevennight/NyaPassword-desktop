@@ -863,6 +863,9 @@ pub struct QuickAccessView {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BrowserBridgeView {
+    /// Allowed without being in settings (the published extension).
+    store_extension_ids: Vec<String>,
+    /// Other IDs from settings (an unpacked or self-built extension).
     extension_ids: Vec<String>,
     pairings: Vec<Pairing>,
     #[serde(flatten)]
@@ -887,7 +890,16 @@ fn settings_view(app: &AppHandle, state: &AppState) -> DesktopSettingsView {
             auto_type_supported: state.platform.auto_type_supported(),
         },
         browser_bridge: BrowserBridgeView {
-            extension_ids: s.browser_bridge.extension_ids,
+            store_extension_ids: browser_bridge::STORE_EXTENSION_IDS
+                .iter()
+                .map(|i| i.to_string())
+                .collect(),
+            extension_ids: s
+                .browser_bridge
+                .extension_ids
+                .into_iter()
+                .filter(|i| !browser_bridge::STORE_EXTENSION_IDS.contains(&i.as_str()))
+                .collect(),
             pairings: s.browser_bridge.pairings,
             status: state.bridge.status(),
         },
@@ -1003,16 +1015,13 @@ pub async fn set_browser_bridge(
     let mut ids: Vec<String> = extension_ids
         .iter()
         .map(|s| s.trim().to_lowercase())
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty() && !browser_bridge::STORE_EXTENSION_IDS.contains(&s.as_str()))
         .collect();
     ids.dedup();
     if let Some(bad) = ids.iter().find(|i| !browser_bridge::valid_extension_id(i)) {
         return Err(BridgeError::invalid(format!(
             "“{bad}” 不是扩展 ID（32 个 a–p 的小写字母，见扩展弹窗 ⚙）"
         )));
-    }
-    if enabled && ids.is_empty() {
-        return Err(BridgeError::invalid("请先填写浏览器扩展的 ID"));
     }
     state.update_settings(|s| {
         s.browser_bridge.enabled = enabled;
