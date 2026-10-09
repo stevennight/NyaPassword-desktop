@@ -44,12 +44,16 @@ pub struct UnlockSettings {
     /// "启动时可直接用生物识别解锁": Windows Hello works after a restart
     /// without a master-password unlock in this run (still within 14 days).
     pub biometric_at_start: bool,
+    /// Lock when the session locks, logs off or the computer sleeps (on by
+    /// default; the extension and Android have the same switch).
+    pub lock_on_session_lock: bool,
 }
 
 impl Default for UnlockSettings {
     fn default() -> Self {
         Self {
             biometric_at_start: true,
+            lock_on_session_lock: true,
         }
     }
 }
@@ -198,6 +202,7 @@ mod tests {
         assert_eq!(l.export.keep, 3);
         assert_eq!(l.export.interval_days, 7);
         assert!(l.check_updates);
+        assert!(l.unlock.lock_on_session_lock);
         // settings files written before M5 get the new sections' defaults
         assert!(!l.ssh_agent.enabled);
         assert!(l.quick_access.enabled);

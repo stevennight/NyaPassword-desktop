@@ -76,7 +76,16 @@ pub fn run() {
             tray::create(app.handle())?;
 
             let handle = app.handle().clone();
-            platform::native().watch_session_lock(Arc::new(move || lock_all(&handle, "session")));
+            platform::native().watch_session_lock(Arc::new(move || {
+                if handle
+                    .state::<AppState>()
+                    .settings()
+                    .unlock
+                    .lock_on_session_lock
+                {
+                    lock_all(&handle, "session");
+                }
+            }));
 
             if !std::env::args().any(|a| a == MINIMIZED_ARG) {
                 show_main(app.handle());
@@ -119,6 +128,7 @@ pub fn run() {
             commands::set_pin,
             commands::remove_pin,
             commands::set_biometric_at_start,
+            commands::set_lock_on_session_lock,
             commands::sync,
             commands::events_token,
             commands::vaults,

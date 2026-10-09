@@ -440,6 +440,16 @@ pub fn remove_pin(state: St<'_>) -> CmdResult<()> {
 }
 
 #[tauri::command]
+pub fn set_lock_on_session_lock(
+    app: AppHandle,
+    state: St<'_>,
+    enabled: bool,
+) -> DesktopSettingsView {
+    state.update_settings(|s| s.unlock.lock_on_session_lock = enabled);
+    settings_view(&app, &state)
+}
+
+#[tauri::command]
 pub fn set_biometric_at_start(state: St<'_>, enabled: bool) {
     state.update_settings(|s| s.unlock.biometric_at_start = enabled);
 }
@@ -840,6 +850,7 @@ pub struct DesktopSettingsView {
     exporting: bool,
     autostart: bool,
     check_updates: bool,
+    lock_on_session_lock: bool,
     ssh_agent: SshAgentView,
     quick_access: QuickAccessView,
     browser_bridge: BrowserBridgeView,
@@ -879,6 +890,7 @@ fn settings_view(app: &AppHandle, state: &AppState) -> DesktopSettingsView {
         exporting: state.exporting.load(Ordering::SeqCst),
         autostart: state.platform.autostart_enabled(app),
         check_updates: s.check_updates,
+        lock_on_session_lock: s.unlock.lock_on_session_lock,
         ssh_agent: SshAgentView {
             endpoint_setting: s.ssh_agent.endpoint,
             status: state.ssh.status(),
