@@ -1,6 +1,6 @@
 [package]
 name = "nyapassword-desktop"
-version = "0.1.3"
+version = "0.1.4"
 description = "NyaPassword desktop app: the shared vault UI over the native client core"
 authors = ["NyaPassword contributors"]
 edition = "2021"
