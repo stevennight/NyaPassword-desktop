@@ -497,6 +497,44 @@ pub fn tags(state: St<'_>) -> CmdResult<Vec<String>> {
 }
 
 #[tauri::command]
+pub fn tag_counts(state: St<'_>) -> CmdResult<Vec<npw_core::TagCount>> {
+    Ok(state.client()?.tag_counts()?)
+}
+
+#[tauri::command]
+pub fn bulk_update(
+    state: St<'_>,
+    items: Vec<npw_core::ItemRef>,
+    action: npw_core::BulkAction,
+) -> CmdResult<npw_core::BulkReport> {
+    Ok(state.client()?.bulk_update(&items, &action)?)
+}
+
+#[tauri::command]
+pub fn rename_tag(state: St<'_>, from: String, to: String) -> CmdResult<npw_core::BulkReport> {
+    Ok(state.client()?.rename_tag(&from, &to)?)
+}
+
+#[tauri::command]
+pub fn delete_tag(state: St<'_>, tag: String) -> CmdResult<npw_core::BulkReport> {
+    Ok(state.client()?.delete_tag(&tag)?)
+}
+
+#[tauri::command]
+pub fn duplicates(state: St<'_>) -> CmdResult<Vec<npw_core::DuplicateGroup>> {
+    Ok(state.client()?.duplicates()?)
+}
+
+#[tauri::command]
+pub async fn merge_items(
+    state: St<'_>,
+    keep: npw_core::ItemRef,
+    others: Vec<npw_core::ItemRef>,
+) -> CmdResult<npw_core::MergeReport> {
+    Ok(state.client()?.merge_items(&keep, &others).await?)
+}
+
+#[tauri::command]
 pub fn new_item(template: String, locale: Option<String>) -> CmdResult<ItemContent> {
     let t =
         npw_model::template(&template).ok_or_else(|| BridgeError::invalid("unknown template"))?;
