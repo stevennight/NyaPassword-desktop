@@ -133,6 +133,7 @@ impl Platform for Windows {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
         let start = |flags: u32| {
             std::process::Command::new(&exe)
+                .arg(MINIMIZED_ARG)
                 .creation_flags(flags)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())

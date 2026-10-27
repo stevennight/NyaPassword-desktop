@@ -264,11 +264,13 @@ pub trait Platform: Send + Sync {
     /// process, here the browser's host, pass that right on).
     fn allow_app_foreground(&self) {}
 
-    /// Host mode: starts the app (normal start, single instance) when an
-    /// interactive unlock request finds it not running.
+    /// Host mode: starts the app (single instance) when an interactive unlock
+    /// request finds it not running. It starts in the tray: the request shows
+    /// the unlock screen, and after the unlock the window goes back there.
     fn launch_app(&self) -> Result<(), String> {
         let exe = self.native_host_exe()?;
         std::process::Command::new(exe)
+            .arg(MINIMIZED_ARG)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
