@@ -195,6 +195,12 @@ pub trait Platform: Send + Sync {
         None
     }
 
+    /// Gives the focus back to `target` (a window [`Platform::foreground_window`]
+    /// captured); whether it is in front now.
+    fn activate_window(&self, _target: &TargetWindow) -> bool {
+        false
+    }
+
     fn auto_type_supported(&self) -> bool {
         false
     }

@@ -334,6 +334,19 @@ impl Platform for Windows {
         }
     }
 
+    fn activate_window(&self, target: &TargetWindow) -> bool {
+        let hwnd = HWND(target.handle as *mut c_void);
+        unsafe {
+            if !IsWindow(Some(hwnd)).as_bool() {
+                return false;
+            }
+            if IsIconic(hwnd).as_bool() {
+                let _ = ShowWindow(hwnd, SW_RESTORE);
+            }
+            SetForegroundWindow(hwnd).as_bool()
+        }
+    }
+
     fn auto_type_supported(&self) -> bool {
         true
     }

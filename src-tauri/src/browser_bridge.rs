@@ -59,7 +59,7 @@ use tokio::sync::{broadcast, mpsc};
 use zeroize::Zeroizing;
 
 use crate::ipc::{self, Listener};
-use crate::platform::NATIVE_HOST_NAME;
+use crate::platform::{TargetWindow, NATIVE_HOST_NAME};
 use crate::prompts::{Decision, PromptInfo};
 use crate::settings::Pairing;
 use crate::state::{now_ms, show_main, AppState, EVENT_UNLOCK_REQUEST};
@@ -592,6 +592,18 @@ pub struct BrowserBridge {
     status: Mutex<BridgeStatus>,
     /// The interactive unlock request waiting for the user (one at a time).
     pub wait: UnlockWait,
+    /// How the main window was before that request brought it to the front.
+    before: Mutex<Option<WindowBefore>>,
+}
+
+/// The main window before an interactive unlock request showed it, so that
+/// after the unlock it goes back out of the way of the browser.
+struct WindowBefore {
+    visible: bool,
+    minimized: bool,
+    focused: bool,
+    /// The window that had the focus (the browser), on platforms that can tell.
+    foreground: Option<TargetWindow>,
 }
 
 impl Default for BrowserBridge {
@@ -601,6 +613,7 @@ impl Default for BrowserBridge {
             task: Mutex::new(None),
             status: Mutex::new(BridgeStatus::default()),
             wait: UnlockWait::default(),
+            before: Mutex::new(None),
         }
     }
 }
@@ -624,6 +637,36 @@ impl BrowserBridge {
 
 struct AppHost {
     app: AppHandle,
+}
+
+impl AppHost {
+    /// After an interactive request was answered with an unlock, puts the
+    /// main window back the way it was, so it no longer covers the browser.
+    /// Timed out / failed: the window stays where the user may still be.
+    fn restore_window(&self) {
+        let st = self.app.state::<AppState>();
+        let Some(before) = st.bridge.before.lock().expect("before").take() else {
+            return;
+        };
+        if !self.lock_state().unlocked {
+            return;
+        }
+        let Some(w) = self.app.get_webview_window("main") else {
+            return;
+        };
+        if before.visible && !before.minimized && before.focused {
+            return; // the user was in the app already
+        }
+        // the focus goes back first, while this app still owns the foreground
+        if let Some(t) = &before.foreground {
+            st.platform.activate_window(t);
+        }
+        if !before.visible {
+            let _ = w.hide();
+        } else if before.minimized {
+            let _ = w.minimize();
+        }
+    }
 }
 
 impl Host for AppHost {
@@ -706,7 +749,17 @@ impl Host for AppHost {
             .app
             .emit(EVENT_UNLOCK_REQUEST, if active { browser } else { "" });
         if !active {
+            self.restore_window();
             return;
+        }
+        if let Some(w) = self.app.get_webview_window("main") {
+            let st = self.app.state::<AppState>();
+            *st.bridge.before.lock().expect("before") = Some(WindowBefore {
+                visible: w.is_visible().unwrap_or(false),
+                minimized: w.is_minimized().unwrap_or(false),
+                focused: w.is_focused().unwrap_or(false),
+                foreground: st.platform.foreground_window(),
+            });
         }
         show_main(&self.app);
         if let Some(w) = self.app.get_webview_window("main") {
