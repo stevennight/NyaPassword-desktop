@@ -3,7 +3,7 @@
 //! Apple Silicon Mac that sheet can be completed with Touch ID and falls back
 //! to the account password according to the user's macOS settings.
 
-use std::process::Command;
+use std::ffi::CString;
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -16,28 +16,20 @@ pub struct MacOs;
 
 const TOUCH_ID_SECRET_PREFIX: &str = "touch-id-quick-unlock.";
 
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn npw_touch_id_available() -> i32;
+    fn npw_touch_id_authenticate(reason: *const std::ffi::c_char) -> i32;
+}
+
 fn authenticate(reason: &str) -> Result<(), String> {
-    let escaped = reason.replace('\\', "\\\\").replace('"', "\\\"");
-    // Authorization Services presents the native macOS authentication sheet.
-    // On Macs configured for Touch ID it offers Touch ID first, with the
-    // account password as the normal fallback. This path is available without
-    // an Apple Developer certificate because it is an OS-level authorization.
-    let script = format!(
-        "do shell script \"/usr/bin/true\" with administrator privileges with prompt \"{escaped}\""
-    );
-    let output = Command::new("/usr/bin/osascript")
-        .args(["-l", "AppleScript", "-e", &script])
-        .output()
-        .map_err(|e| format!("无法启动 macOS LocalAuthentication：{e}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if detail.is_empty() {
-            Err("已取消或未通过 Touch ID / macOS 系统验证".into())
-        } else {
-            Err(format!("macOS 系统验证失败：{detail}"))
-        }
+    let reason = CString::new(reason).map_err(|_| "Touch ID 验证说明包含无效字符".to_string())?;
+    let result = unsafe { npw_touch_id_authenticate(reason.as_ptr()) };
+    match result {
+        0 => Ok(()),
+        -2 => Err("Touch ID 不可用，请在系统设置中录入指纹后重试".into()),
+        -3 => Err("Touch ID 验证超时".into()),
+        _ => Err("已取消或未通过 Touch ID 验证".into()),
     }
 }
 
@@ -61,7 +53,7 @@ impl Platform for MacOs {
     }
 
     fn quick_unlock_supported(&self) -> bool {
-        cfg!(target_os = "macos")
+        unsafe { npw_touch_id_available() != 0 }
     }
 
     fn quick_unlock_create(&self, name: &str, challenge: &[u8]) -> Result<Vec<u8>, String> {
