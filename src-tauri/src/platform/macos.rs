@@ -18,17 +18,26 @@ const TOUCH_ID_SECRET_PREFIX: &str = "touch-id-quick-unlock.";
 
 fn authenticate(reason: &str) -> Result<(), String> {
     let escaped = reason.replace('\\', "\\\\").replace('"', "\\\"");
+    // Authorization Services presents the native macOS authentication sheet.
+    // On Macs configured for Touch ID it offers Touch ID first, with the
+    // account password as the normal fallback. This path is available without
+    // an Apple Developer certificate because it is an OS-level authorization.
     let script = format!(
-        "use framework \"LocalAuthentication\"\nproperty finished : false\nproperty accepted : false\nset context to current application's LAContext's alloc()'s init()\nset policy to 2\nset canUse to context's canEvaluatePolicy:error:(policy, missing value)\nif canUse is false then return \"UNAVAILABLE\"\ncontext's evaluatePolicy:localizedReason:reply:(policy, \"{escaped}\", my replyHandler)\nrepeat while finished is false\n    delay 0.1\nend repeat\nif accepted then return \"OK\"\nreturn \"NO\"\non replyHandler(success, failure)\n    set accepted to success as boolean\n    set finished to true\nend replyHandler"
+        "do shell script \"/usr/bin/true\" with administrator privileges with prompt \"{escaped}\""
     );
     let output = Command::new("/usr/bin/osascript")
         .args(["-l", "AppleScript", "-e", &script])
         .output()
         .map_err(|e| format!("无法启动 macOS LocalAuthentication：{e}"))?;
-    match String::from_utf8_lossy(&output.stdout).trim() {
-        "OK" => Ok(()),
-        "UNAVAILABLE" => Err("Touch ID / macOS 系统验证不可用，请先输入主密码".into()),
-        _ => Err("已取消或未通过 Touch ID / macOS 系统验证".into()),
+    if output.status.success() {
+        Ok(())
+    } else {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if detail.is_empty() {
+            Err("已取消或未通过 Touch ID / macOS 系统验证".into())
+        } else {
+            Err(format!("macOS 系统验证失败：{detail}"))
+        }
     }
 }
 
