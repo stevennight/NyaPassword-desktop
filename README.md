@@ -8,7 +8,7 @@ NyaPassword 的桌面客户端：Tauri 2 外壳 + 共享界面（`../common/web`
 
 - **完整的密码库界面**：与网页版同一套界面（登录 / 注册、三栏主界面、编辑、生成器、TOTP、附件、导入导出、安全检查、设置），核心在本机原生运行（Argon2 比 WASM 快）。离线也能用主密码解锁。
 - **本地副本**：`<本地应用数据>/app.nya.password/replica.sqlite3`（Windows：`%LOCALAPPDATA%\app.nya.password\`），只有密文。保护 Secret Key 和会话的设备密钥（32 字节随机数）存在系统凭据存储：Windows 凭据管理器 / macOS 钥匙串 / Linux Secret Service；系统凭据存储不可用时退回到同目录的 `device-key.bin`（设置页会提示）。
-- **Windows Hello 快速解锁**：在“设置 → 解锁与锁定”开启。开启时 Windows Hello 创建密钥 `NyaPassword.<账户 ID>` 并对随机 32 字节挑战签名，签名经 HKDF-SHA256 得到包装密钥，包装账户密钥后与挑战一起存到 `quick-unlock.json`。“启动时可直接用生物识别解锁”（默认开）：应用重启后也可以直接用 Windows Hello；关掉则每次启动后第一次要输入主密码。Windows Hello 密钥不见了（重置 Windows Hello）或解不开包装时自动关闭并要求主密码。关闭时删除系统中的密钥和文件。macOS（Touch ID）/ Linux 暂不支持。
+- **系统身份验证**：Windows 使用 Windows Hello，macOS 使用系统授权对话框。Apple Silicon Mac 上该对话框可直接使用 Touch ID，并按 macOS 设置提供密码回退。快速解锁密钥仍遵循各平台的安全存储与主密码解锁规则。
 - **PIN 解锁**：“设置 → 解锁与锁定 → PIN 解锁”设置 / 修改 / 删除。PIN 至少 4 个字符（任意字符）；核心用 `Argon2id(NFKD(PIN), 随机盐, 账户的 KDF 参数)` 包装账户密钥，结果和尝试次数一起存进 Windows 凭据管理器（条目 `app.nya.password` / `unlock-guard`，DPAPI 保护，不在任何文件里，不上传）。每次尝试前先把次数写回，连续 5 次错误删除 PIN；锁屏的 PIN 输入框显示剩余次数。设备密钥退回到 `device-key.bin` 文件时不能设置 PIN。重启后可用。
 - **14 天规则**：Windows Hello 和 PIN 都只在距上次在本机输入主密码不到 14 天时可用，到期后暂停（锁屏会说明原因），输入主密码即恢复。上次输入主密码的时间和 PIN 在同一条凭据存储记录里，改 `settings.json` 不能延长；系统时间比应用见过的最晚时间早 10 分钟以上也会暂停。在本机修改主密码后，Windows Hello 和 PIN 都被清除，需要重新设置。规格见 [加密规格.md](../common/docs/加密规格.md) §4.4、§4.5，风险见 [威胁模型.md](../common/docs/威胁模型.md) §3.8.2。
 - **托盘与后台**：关闭窗口只是隐藏到托盘；托盘菜单：显示 / 隐藏、锁定、立即同步、退出。单实例（再次启动只会把已有窗口调到前面）。可设置开机启动（直接最小化到托盘）。
@@ -21,7 +21,7 @@ NyaPassword 的桌面客户端：Tauri 2 外壳 + 共享界面（`../common/web`
 - **定期离线导出**（见下）。
 - **自更新**（见下）。
 
-尚未实现（后续阶段）：Windows passkey 提供程序；macOS Touch ID、macOS / Linux 锁屏检测；macOS / Linux 的自动输入。
+尚未实现（后续阶段）：Windows passkey 提供程序；macOS / Linux 锁屏检测；macOS / Linux 的自动输入。
 
 ### 快捷搜索与自动输入
 
@@ -189,7 +189,7 @@ Windows 安装包在 `..\target\release\bundle\nsis\NyaPassword_<版本>_x64-set
 git push origin HEAD v0.1.0
 ```
 
-推送 tag 后 GitHub Actions 用固定的 common 提交测试并构建：`NyaPassword_<版本>_x64-setup.exe`、`NyaPassword_<版本>_windows_x64.zip`（便携版）、`NyaPassword_<版本>_macos_arm64.dmg`、`NyaPassword_<版本>_macos_x64.dmg`、`NyaPassword_<版本>_linux_x64.AppImage`、`NyaPassword_<版本>_linux_x64.deb`，再生成 `SHA256SUMS` 并签名为 `SHA256SUMS.minisig`，发布 Release（带后缀的版本为预发布）。macOS 版没有 Apple 公证，首次打开需在“系统设置 → 隐私与安全性”里放行。
+推送 tag 后 GitHub Actions 用固定的 common 提交测试并构建：`NyaPassword_<版本>_x64-setup.exe`、`NyaPassword_<版本>_windows_x64.zip`（便携版）、`NyaPassword_<版本>_macos_arm64.dmg`、`NyaPassword_<版本>_macos_x64.dmg`、`NyaPassword_<版本>_linux_x64.AppImage`、`NyaPassword_<版本>_linux_x64.deb`，再生成 `SHA256SUMS` 并签名为 `SHA256SUMS.minisig`，发布 Release（带后缀的版本为预发布）。macOS ARM 包使用 `aarch64-apple-darwin` 构建，适用于 M 系列芯片。发布时应使用 Apple Developer ID 签名并公证，否则首次打开需在“系统设置 → 隐私与安全性”里放行。
 
 仓库 secrets：
 
