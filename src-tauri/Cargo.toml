@@ -1,6 +1,6 @@
 [package]
 name = "nyapassword-desktop"
-version = "0.1.12"
+version = "0.1.13"
 description = "NyaPassword desktop app: the shared vault UI over the native client core"
 authors = ["NyaPassword contributors"]
 edition = "2021"
@@ -39,7 +39,8 @@ serde_json = "1"
 zeroize = "1"
 hkdf = "0.12"
 sha2 = "0.10"
-uuid = "1"
+uuid = { version = "1", features = ["v4"] }
+hmac = "0.12"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 semver = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }

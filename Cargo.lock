@@ -3428,13 +3428,14 @@ dependencies = [
 
 [[package]]
 name = "nyapassword-desktop"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "aes-gcm",
  "arboard",
  "base64 0.22.1",
  "chrono",
  "gethostname",
+ "hmac 0.12.1",
  "hkdf 0.12.4",
  "keyring",
  "log",
